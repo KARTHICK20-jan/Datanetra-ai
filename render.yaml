@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: innovation-stage1
+    runtime: python
+    buildCommand: >
+      python3 -m venv --clear /opt/render/project/venv &&
+      /opt/render/project/venv/bin/pip install --upgrade pip &&
+      /opt/render/project/venv/bin/pip install -r requirements.txt &&
+      /opt/render/project/venv/bin/python patch_gradio.py &&
+      find /opt/render/project/venv/lib -name '*.pyc' -path '*/gradio/*' -delete &&
+      find /opt/render/project/venv/lib -name '*.pyc' -path '*/gradio_client/*' -delete
+    startCommand: /opt/render/project/venv/bin/python app.py
+    plan: free
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "0"
