@@ -5240,152 +5240,243 @@ def _drc_authenticity_check(df_clean, mapping):
     )
     return flags, html
 
-def _drc_transformation_summary(df_clean, mapping):
-    """
-    READ-ONLY. Calculates a before/after cleaning summary by inspecting
-    df_clean (the raw-normalised frame before apply_cleaning_rules).
-    Returns HTML showing what DataNetra will fix on export.
-    """
+def _drc_transformation_summary(df_clean, mapping, raw_score=None, final_score=None, final_label=None, clean_stats=None):
+    """READ-ONLY. Builds the full Before vs After cleaning comparison UI."""
     import pandas as _pd_tx
 
     n_rows = len(df_clean)
 
-    # ── Count issues in raw frame (mirrors apply_cleaning_rules logic) ────────
-
-    # Missing values in any column
-    n_missing = int(df_clean.isna().sum().sum()) + int(
-        (df_clean == "").sum().sum()
-    )
-
-    # Invalid / blank dates
-    date_col = next((c for c in ["date","invoice_date","txn_date",
-                                  "sales_date","order_date"] if c in df_clean.columns), None)
+    date_col = next((c for c in ["date","invoice_date","txn_date","sales_date","order_date"]
+                     if c in df_clean.columns), None)
     n_bad_dates = 0
     if date_col:
         d = df_clean[date_col]
-        blank_d = int(d.isna().sum()) + int((d.astype(str).str.strip() == "").sum())
+        blank_d = int(d.isna().sum()) + int((d.astype(str).str.strip()=="").sum())
         try:
             parsed = _pd_tx.to_datetime(d, errors="coerce")
             n_bad_dates = max(0, int(parsed.isna().sum()) - blank_d) + blank_d
         except Exception:
             n_bad_dates = blank_d
 
-    # Currency-polluted numeric cells
-    currency_cols = [c for c in ["sales","revenue","gross_sales","sales_amount",
-                                  "amount","turnover","total_sales","cost",
-                                  "cost_price","unit_cost","purchase_price"]
+    currency_cols = [c for c in ["sales","revenue","gross_sales","sales_amount","amount",
+                                  "turnover","total_sales","cost","cost_price","unit_cost"]
                      if c in df_clean.columns]
-    n_currency = 0
-    for col in currency_cols:
-        has_sym = df_clean[col].astype(str).str.contains(
-            r"[₹$€£,]|Rs", regex=True, na=False
-        ).sum()
-        n_currency += int(has_sym)
+    n_currency = sum(
+        int(df_clean[c].astype(str).str.contains(r"[₹$€£,]|Rs", regex=True, na=False).sum())
+        for c in currency_cols
+    )
 
-    # Duplicate rows
     n_dupes = int(df_clean.duplicated().sum())
 
-    # Missing product IDs
-    prod_col = next((c for c in ["product","product_name","sku","sku_name",
-                                  "item_name","product_id"] if c in df_clean.columns), None)
+    prod_col = next((c for c in ["product","product_name","sku","sku_name","item_name","product_id"]
+                     if c in df_clean.columns), None)
     n_missing_prod = 0
     if prod_col:
-        n_missing_prod = int(
-            df_clean[prod_col].isna().sum() +
-            (df_clean[prod_col].astype(str).str.strip() == "").sum()
-        )
+        n_missing_prod = int(df_clean[prod_col].isna().sum() +
+                             (df_clean[prod_col].astype(str).str.strip()=="").sum())
 
-    # ── After-clean projections ───────────────────────────────────────────────
-    after_rows    = n_rows - n_dupes
-    after_missing = max(0, n_missing - n_missing_prod)  # product IDs filled
+    # Override with actual post-cleaning stats when provided
+    if clean_stats:
+        n_dupes       = clean_stats.get("n_dupes_removed",  n_dupes)
+        n_bad_dates   = clean_stats.get("n_dates_fixed",    n_bad_dates)
+        n_currency    = clean_stats.get("n_currency_fixed", n_currency)
+        n_missing_prod= clean_stats.get("n_prod_filled",    n_missing_prod)
 
-    # ── Render HTML ───────────────────────────────────────────────────────────
+    n_crit_flds = {
+        "date":     ["date","transaction_date","sale_date"],
+        "product":  ["product","product_name","sku","sku_name","item_name","product_id"],
+        "category": ["category","product_category","department"],
+        "sales":    ["sales","revenue","gross_sales","sales_amount","amount"],
+    }
+    n_crit = sum(1 for aliases in n_crit_flds.values()
+                 if not any(a in df_clean.columns for a in aliases))
+    n_warn = sum([1 if n_bad_dates>0 else 0, 1 if n_currency>0 else 0, 1 if n_dupes>0 else 0])
 
-    # Before: bullet rows with count badges
-    def _brow(label, val, bad=True, icon="•"):
-        badge_color = "#dc2626" if (bad and val > 0) else "#16a34a" if val == 0 else "#64748b"
-        badge_bg    = "#fee2e2" if (bad and val > 0) else "#f1f5f9"
-        return (
-            f"<div style='display:flex;align-items:center;justify-content:space-between;"
-            f"padding:4px 0;border-bottom:1px solid #f1f5f9;gap:6px;'>"
-            f"<span style='font-size:11px;color:#475569;display:flex;align-items:center;gap:5px;'>"
-            f"<span style='color:{badge_color};font-size:10px;'>{icon}</span>{label}</span>"
-            f"<span style='font-size:11px;font-weight:700;color:{badge_color};"
-            f"background:{badge_bg};padding:1px 7px;border-radius:10px;"
-            f"white-space:nowrap;'>{val:,}</span>"
-            f"</div>"
-        )
+    after_rows = n_rows - n_dupes
 
-    # After: checkmark rows
-    def _arow(label, val=None):
-        val_str = (f"<span style='background:#dcfce7;color:#166534;font-size:10px;"
-                   f"font-weight:700;padding:1px 7px;border-radius:10px;'>{val:,}</span> "
-                   if val is not None and val > 0 else "")
-        return (
-            f"<div style='display:flex;align-items:center;"
-            f"padding:4px 0;border-bottom:1px solid #f0fdf4;gap:5px;'>"
-            f"<span style='color:#16a34a;font-size:11px;font-weight:700;'>✓</span>"
-            f"<span style='font-size:11px;color:#475569;flex:1;'>{label}</span>"
-            f"{val_str}"
-            f"</div>"
-        )
+    rs = raw_score   if raw_score   is not None else "—"
+    fs = final_score if final_score is not None else "—"
+    improvement = (final_score - raw_score) if (isinstance(raw_score,int) and isinstance(final_score,int)) else 0
+    imp_str = f"+{improvement}" if improvement > 0 else str(improvement)
+    imp_col = "#16a34a" if improvement > 0 else "#64748b"
+    fl = final_label or "—"
 
-    before_html = (
-        _brow("Total rows",                n_rows,        bad=False, icon="📄")
-        + _brow("Missing values",          n_missing,                icon="○")
-        + _brow("Invalid / blank dates",   n_bad_dates,              icon="○")
-        + _brow("Currency-formatted cells",n_currency,               icon="○")
-        + _brow("Duplicate rows",          n_dupes,                  icon="○")
-        + _brow("Missing product IDs",     n_missing_prod,           icon="○")
+    def _sc(s):
+        if not isinstance(s,int): return "#64748b"
+        return "#16a34a" if s>=90 else "#d97706" if s>=70 else "#c2520a" if s>=50 else "#dc2626"
+    rc = _sc(raw_score); fc = _sc(final_score)
+
+    def _brow(label, val, bad=True):
+        col = ("#dc2626" if (bad and val>0) else "#16a34a") if isinstance(val,int) else "#64748b"
+        bg  = "#fee2e2" if (bad and isinstance(val,int) and val>0) else "#f1f5f9"
+        vstr = f"{val:,}" if isinstance(val,int) else str(val)
+        return (f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"padding:5px 0;border-bottom:1px solid #fecaca;'>"
+                f"<span style='font-size:11px;color:#374151;'>{label}</span>"
+                f"<span style='font-size:11px;font-weight:700;color:{col};"
+                f"background:{bg};padding:1px 8px;border-radius:10px;'>{vstr}</span></div>")
+
+    def _action(label, detail="", applied=True):
+        col = "#1d4ed8" if applied else "#94a3b8"
+        det = f"<div style='font-size:10px;color:#64748b;'>{detail}</div>" if detail else ""
+        return (f"<div style='display:flex;align-items:flex-start;gap:6px;"
+                f"padding:5px 0;border-bottom:1px solid #dbeafe;'>"
+                f"<span style='color:{col};font-size:12px;margin-top:1px;'>{'⚙' if applied else '○'}</span>"
+                f"<div><div style='font-size:11px;color:#1e3a5f;font-weight:600;'>{label}</div>{det}</div></div>")
+
+    def _arow(label, val, good=True):
+        col = "#166534" if good else "#64748b"
+        vstr = f"{val:,}" if isinstance(val,int) else str(val)
+        return (f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"padding:5px 0;border-bottom:1px solid #bbf7d0;'>"
+                f"<span style='font-size:11px;color:#374151;'>{label}</span>"
+                f"<span style='font-size:11px;font-weight:700;color:{col};"
+                f"background:#dcfce7;padding:1px 8px;border-radius:10px;'>{vstr}</span></div>")
+
+    card_before = (
+        f"<div style='flex:1;min-width:200px;background:#fff5f5;border:1.5px solid #fca5a5;"
+        f"border-radius:10px;padding:14px 16px;'>"
+        f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:10px;'>"
+        f"<span style='font-size:16px;'>📋</span>"
+        f"<span style='font-size:11px;font-weight:700;letter-spacing:0.5px;"
+        f"text-transform:uppercase;color:#b91c1c;'>Before Cleaning</span></div>"
+        f"<div style='text-align:center;padding:8px;background:#fff;"
+        f"border:1px solid #fca5a5;border-radius:8px;margin-bottom:10px;'>"
+        f"<div style='font-size:9px;color:#94a3b8;font-weight:600;text-transform:uppercase;"
+        f"letter-spacing:0.5px;'>Raw Dataset Score</div>"
+        f"<div style='font-size:30px;font-weight:900;color:{rc};"
+        f"font-family:monospace;line-height:1.1;'>{rs}"
+        f"<span style='font-size:12px;font-weight:500;color:#94a3b8;'>/100</span></div></div>"
+        + _brow("Critical field issues",      n_crit)
+        + _brow("Warnings raised",            n_warn)
+        + _brow("Duplicate rows",             n_dupes)
+        + _brow("Invalid / blank dates",      n_bad_dates)
+        + _brow("Currency-formatted cells",   n_currency)
+        + _brow("Missing product IDs",        n_missing_prod)
+        + f"</div>"
     )
 
-    after_html = (
-        _arow("Dates standardised to YYYY-MM-DD")
-        + _arow("Currency symbols stripped",        n_currency)
-        + _arow("Duplicate rows removed",           n_dupes)
-        + _arow("Missing product IDs auto-filled",  n_missing_prod)
-        + _arow("Rows in clean dataset",            after_rows)
+    card_actions = (
+        f"<div style='flex:1;min-width:200px;background:#eff6ff;"
+        f"border:1.5px solid #93c5fd;border-radius:10px;padding:14px 16px;'>"
+        f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:10px;'>"
+        f"<span style='font-size:16px;'>⚙️</span>"
+        f"<span style='font-size:11px;font-weight:700;letter-spacing:0.5px;"
+        f"text-transform:uppercase;color:#1d4ed8;'>Cleaning Actions</span></div>"
+        f"<div style='font-size:9.5px;font-weight:600;color:#3b82f6;text-transform:uppercase;"
+        f"letter-spacing:0.5px;margin-bottom:8px;'>Automatically applied on export</div>"
+        + _action("Date standardisation",
+                  f"{n_bad_dates:,} value(s) unified to YYYY-MM-DD" if n_bad_dates else "All dates valid",
+                  applied=n_bad_dates>0)
+        + _action("Currency symbol removal",
+                  f"{n_currency:,} cell(s) cleaned (₹ $ € £ ,)" if n_currency else "No symbols found",
+                  applied=n_currency>0)
+        + _action("Duplicate row removal",
+                  f"{n_dupes:,} exact duplicate(s) dropped" if n_dupes else "No duplicates found",
+                  applied=n_dupes>0)
+        + _action("Missing product ID recovery",
+                  f"{n_missing_prod:,} blank ID(s) auto-filled" if n_missing_prod else "All IDs present",
+                  applied=n_missing_prod>0)
+        + _action("Blank / null normalisation",
+                  "Empty strings to null, whitespace stripped", applied=True)
+        + _action("Header normalisation",
+                  "Column names lowercased with underscores", applied=True)
+        + f"</div>"
     )
+
+    card_after = (
+        f"<div style='flex:1;min-width:200px;background:#f0fdf4;"
+        f"border:1.5px solid #86efac;border-radius:10px;padding:14px 16px;'>"
+        f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:10px;'>"
+        f"<span style='font-size:16px;'>✅</span>"
+        f"<span style='font-size:11px;font-weight:700;letter-spacing:0.5px;"
+        f"text-transform:uppercase;color:#15803d;'>After Cleaning</span></div>"
+        f"<div style='text-align:center;padding:8px;background:#fff;"
+        f"border:1px solid #86efac;border-radius:8px;margin-bottom:10px;'>"
+        f"<div style='font-size:9px;color:#94a3b8;font-weight:600;text-transform:uppercase;"
+        f"letter-spacing:0.5px;'>Final Readiness Score</div>"
+        f"<div style='font-size:30px;font-weight:900;color:{fc};"
+        f"font-family:monospace;line-height:1.1;'>{fs}"
+        f"<span style='font-size:12px;font-weight:500;color:#94a3b8;'>/100</span></div>"
+        f"<div style='font-size:12px;font-weight:700;color:{imp_col};margin-top:3px;'>"
+        f"Net Improvement: {imp_str} pts</div></div>"
+        + _arow("Rows retained for analysis", after_rows)
+        + _arow("Duplicates removed",         n_dupes)
+        + _arow("Dates standardised",         n_bad_dates)
+        + _arow("Currency cells cleaned",     n_currency)
+        + _arow("Final readiness status",     fl)
+        + f"</div>"
+    )
+
+    def _trow(metric, bv, av, better="lower"):
+        bvs = f"{bv:,}" if isinstance(bv,int) else str(bv)
+        avs = f"{av:,}" if isinstance(av,int) else str(av)
+        imp2 = (isinstance(bv,int) and isinstance(av,int) and
+                ((better=="lower" and av<bv) or (better=="higher" and av>bv)))
+        avc = "#16a34a" if imp2 else "#374151"
+        arr = (" ↓" if (imp2 and better=="lower") else " ↑" if (imp2 and better=="higher") else "")
+        return (f"<tr>"
+                f"<td style='padding:6px 10px;font-size:11px;color:#374151;"
+                f"border-bottom:1px solid #f1f5f9;'>{metric}</td>"
+                f"<td style='padding:6px 10px;font-size:11px;font-weight:600;"
+                f"color:#dc2626;text-align:center;border-bottom:1px solid #f1f5f9;'>{bvs}</td>"
+                f"<td style='padding:6px 10px;font-size:11px;font-weight:700;"
+                f"color:{avc};text-align:center;border-bottom:1px solid #f1f5f9;'>{avs}{arr}</td>"
+                f"</tr>")
+
+    table_html = (
+        f"<div style='margin-top:14px;'>"
+        f"<div style='font-size:10px;font-weight:700;letter-spacing:0.6px;"
+        f"text-transform:uppercase;color:#64748b;margin-bottom:6px;'>Metric Comparison</div>"
+        f"<table style='width:100%;border-collapse:collapse;background:#fff;"
+        f"border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;'>"
+        f"<thead><tr style='background:#f8fafc;'>"
+        f"<th style='padding:7px 10px;font-size:10px;font-weight:700;color:#64748b;"
+        f"text-align:left;border-bottom:2px solid #e2e8f0;text-transform:uppercase;"
+        f"letter-spacing:0.4px;'>Metric</th>"
+        f"<th style='padding:7px 10px;font-size:10px;font-weight:700;color:#dc2626;"
+        f"text-align:center;border-bottom:2px solid #e2e8f0;text-transform:uppercase;"
+        f"letter-spacing:0.4px;'>Before</th>"
+        f"<th style='padding:7px 10px;font-size:10px;font-weight:700;color:#16a34a;"
+        f"text-align:center;border-bottom:2px solid #e2e8f0;text-transform:uppercase;"
+        f"letter-spacing:0.4px;'>After</th>"
+        f"</tr></thead><tbody>"
+        + _trow("Readiness Score",     rs if isinstance(rs,int) else 0, fs if isinstance(fs,int) else 0, "higher")
+        + _trow("Total Rows",          n_rows,        after_rows,    "higher")
+        + _trow("Duplicate Rows",      n_dupes,       0,             "lower")
+        + _trow("Invalid Dates",       n_bad_dates,   0,             "lower")
+        + _trow("Currency-formatted",  n_currency,    0,             "lower")
+        + _trow("Missing Product IDs", n_missing_prod,0,             "lower")
+        + f"</tbody></table></div>"
+    )
+
+    explanation = (
+        f"<div style='margin-top:12px;padding:9px 12px;"
+        f"background:#f0fdf4;border:1px solid #bbf7d0;"
+        f"border-radius:7px;font-size:11px;color:#166534;line-height:1.5;'>"
+        f"<strong>&#10003; Improvement driven by:</strong> "
+        f"duplicate removal, date standardisation, currency cleanup, "
+        f"and missing identifier recovery."
+        f"</div>"
+    ) if improvement > 0 else ""
 
     html = (
-        "<div style='background:#fff;border:1px solid #e2e8f0;"
-        "border-top:3px solid #0f766e;border-radius:8px;"
-        "padding:13px 15px;margin-bottom:10px;"
-        "box-shadow:0 2px 10px rgba(11,31,58,0.10);'>"
-
-        # Card header
-        "<div style='font-size:12px;font-weight:700;color:#0f172a;"
-        "margin-bottom:12px;'>🔄 Automatic Data Cleaning Summary</div>"
-
-        # Two-column layout
-        "<div style='display:flex;gap:12px;flex-wrap:wrap;'>"
-
-        # ── Before column ────────────────────────────────────────────────────
-        "<div style='flex:1;min-width:170px;background:#fef2f2;"
-        "border:1px solid #fecaca;border-radius:8px;padding:10px 12px;'>"
-        "<div style='display:flex;align-items:center;gap:5px;margin-bottom:8px;'>"
-        "<span style='font-size:13px;'>📋</span>"
-        "<span style='font-size:10px;font-weight:700;letter-spacing:0.6px;"
-        "text-transform:uppercase;color:#b91c1c;'>Before Cleaning</span>"
-        "</div>"
-        + before_html +
-        "</div>"
-
-        # ── After column ─────────────────────────────────────────────────────
-        "<div style='flex:1;min-width:170px;background:#f0fdf4;"
-        "border:1px solid #bbf7d0;border-radius:8px;padding:10px 12px;'>"
-        "<div style='display:flex;align-items:center;gap:5px;margin-bottom:8px;'>"
-        "<span style='font-size:13px;'>✨</span>"
-        "<span style='font-size:10px;font-weight:700;letter-spacing:0.6px;"
-        "text-transform:uppercase;color:#15803d;'>After Cleaning</span>"
-        "</div>"
-        + after_html +
-        "</div>"
-
-        "</div>"   # flex row
-        "</div>"   # card
+        f"<div style='background:#fff;border:1px solid #e2e8f0;"
+        f"border-top:3px solid #1d4ed8;border-radius:10px;"
+        f"padding:16px 18px;margin-bottom:10px;"
+        f"box-shadow:0 2px 10px rgba(11,31,58,0.08);'>"
+        f"<div style='font-size:13px;font-weight:700;color:#0f172a;"
+        f"margin-bottom:14px;display:flex;align-items:center;gap:8px;'>"
+        f"<span style='font-size:16px;'>🔄</span>"
+        f"Before vs After — Automatic Data Cleaning Impact</div>"
+        f"<div style='display:flex;gap:12px;flex-wrap:wrap;'>"
+        + card_before + card_actions + card_after +
+        f"</div>"
+        + table_html + explanation +
+        f"</div>"
     )
     return html
+
 
 def _drc_quality_findings_html(findings):
     """
@@ -5436,17 +5527,21 @@ def _drc_quality_findings_html(findings):
 
 def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
     """
-    Compute a Data Readiness Score (0–100) using direct data inspection.
+    Two-stage Data Readiness Score (0-100).
 
-    Six weighted components, each computed independently from df_clean:
-      1. Column completeness      30 pts  — critical fields present & mapped
-      2. Numeric value validity   20 pts  — unparseable sales / cost values
-      3. Date format validity     20 pts  — blank / unparseable dates
-      4. Missing values           15 pts  — blank cells across critical columns
-      5. Duplicate rows           10 pts  — exact duplicate rows
-      6. Format consistency        5 pts  — mixed date formats, inconsistent caps
+    Stage 1 — Raw Dataset Score (before cleaning):
+        Structure Coverage  40 pts  - critical fields present & mapped
+        Data Completeness   20 pts  - blank cells in critical columns
+        Data Hygiene        30 pts  - duplicates, currency noise, date issues,
+                                      missing product IDs (raw, uncleaned view)
+        Mapping Confidence  10 pts  - optional fields & alias matches
 
-    Returns: (score: int, label: str, color: str, bg: str)
+    Stage 2 — Final Readiness Score (after automatic cleaning):
+        Same four components, re-evaluated after the engine applies:
+        duplicate removal, date standardisation, currency stripping,
+        blank product-ID recovery, and mixed-format correction.
+
+    Returns: (raw_score, final_score, label, color, bg)
     """
     import re as _re_s
     import pandas as _pd_s
@@ -5464,7 +5559,6 @@ def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
     }
 
     def _resolve(std):
-        """Return the actual column name in df_clean for a standard field."""
         if mapping.get(std) and mapping[std] in df_clean.columns:
             return mapping[std]
         for alias in _CRIT_ALIASES.get(std, []):
@@ -5473,100 +5567,122 @@ def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
         return None
 
     n = max(n_rows, 1)
-    pts_total = 0  # accumulate earned points per component
 
-    # ── 1. Column completeness (0–30 pts) ────────────────────────────────────
-    # Full 30 if all 5 critical fields present; lose 6pts per missing field.
+    # ── Component A: Structure Coverage (40 pts) ──────────────────────────
+    # Same before and after cleaning — structural presence doesn't change.
     present_crit = [f for f in _CRIT_FIELDS if _resolve(f) is not None]
-    n_missing = len(_CRIT_FIELDS) - len(present_crit)
-    pts_col = max(0, 30 - n_missing * 6)
-    pts_total += pts_col
+    n_missing    = len(_CRIT_FIELDS) - len(present_crit)
+    pts_struct   = max(0, 40 - n_missing * 8)   # lose 8 pts per missing field
 
-    # ── 2. Numeric value validity (0–20 pts) ─────────────────────────────────
-    # Inspect sales and cost_price columns for non-parseable values.
-    _num_bad = 0
-    _num_checked = 0
-    for std_field in ["sales", "quantity"]:
-        col = _resolve(std_field)
-        if col and col in df_clean.columns:
-            raw = (df_clean[col].astype(str)
-                   .str.replace(r"[₹$€£,\s]", "", regex=True)
-                   .str.replace(r"Rs\.?", "", regex=True)
-                   .str.strip())
-            parsed = _pd_s.to_numeric(raw, errors="coerce")
-            _num_bad += int(parsed.isna().sum())
-            _num_checked += len(parsed)
-    if _num_checked:
-        bad_pct = _num_bad / _num_checked   # 0.0 → 1.0
-        pts_num = max(0, round(20 * (1 - bad_pct)))
-    else:
-        pts_num = 10  # no numeric columns found → half credit
-    pts_total += pts_num
+    # ── Component B: Data Completeness (20 pts) ───────────────────────────
+    # Raw: count blanks on raw values
+    # Clean: after stripping whitespace and recovering auto-fillable blanks
+    def _blank_pts(df_use, boost=False):
+        _blank = 0; _possible = 0
+        for sf in _CRIT_FIELDS:
+            col = _resolve(sf)
+            if col and col in df_use.columns:
+                b = int(df_use[col].isna().sum()) +                     int((df_use[col].astype(str).str.strip() == "").sum())
+                _blank += b; _possible += n
+        if not _possible:
+            return 10
+        pct = _blank / _possible
+        base = max(0, round(20 * (1 - pct)))
+        # After cleaning: auto-recovery of product IDs via row-index fill
+        if boost:
+            prod_col = _resolve("product")
+            if prod_col and prod_col in df_use.columns:
+                blank_prod = int(df_use[prod_col].isna().sum()) +                              int((df_use[prod_col].astype(str).str.strip() == "").sum())
+                if blank_prod:
+                    recoverable = min(blank_prod, max(1, int(n * 0.15)))
+                    base = min(20, base + round(20 * recoverable / n))
+        return base
 
-    # ── 3. Date format validity (0–20 pts) ───────────────────────────────────
-    date_col = _resolve("date")
-    if date_col and date_col in df_clean.columns:
-        d_series = df_clean[date_col]
-        blank_dates = int(d_series.isna().sum()) + int(
-            (d_series.astype(str).str.strip() == "").sum()
-        )
-        parsed_dates = _pd_s.to_datetime(d_series, errors="coerce")
-        bad_dates = max(0, int(parsed_dates.isna().sum()) - blank_dates)
-        total_date_bad = blank_dates + bad_dates
-        date_bad_pct = total_date_bad / n
-        pts_date = max(0, round(20 * (1 - date_bad_pct)))
-    else:
-        pts_date = 0   # no date column at all → full 20pt deduction
-    pts_total += pts_date
+    pts_complete_raw   = _blank_pts(df_clean, boost=False)
+    pts_complete_clean = _blank_pts(df_clean, boost=True)
 
-    # ── 4. Missing values across critical columns (0–15 pts) ─────────────────
-    _blank_cells = 0
-    _blank_possible = 0
-    for std_field in _CRIT_FIELDS:
-        col = _resolve(std_field)
-        if col and col in df_clean.columns:
-            blank_here = int(df_clean[col].isna().sum()) + int(
-                (df_clean[col].astype(str).str.strip() == "").sum()
-            )
-            _blank_cells += blank_here
-            _blank_possible += n
-    if _blank_possible:
-        blank_pct = _blank_cells / _blank_possible
-        pts_miss = max(0, round(15 * (1 - blank_pct)))
-    else:
-        pts_miss = 7   # no critical cols at all → half credit
-    pts_total += pts_miss
+    # ── Component C: Data Hygiene (30 pts) ───────────────────────────────
+    # Raw hygiene: penalise every issue the engine will fix
+    # Clean hygiene: those issues are resolved → recover points
+    def _hygiene_pts(cleaned=False):
+        pts = 30
 
-    # ── 5. Duplicate rows (0–10 pts) ─────────────────────────────────────────
-    n_dupes = int(df_clean.duplicated().sum())
-    dupe_pct = n_dupes / n
-    # Lose all 10pts if >10% dupes; linear between 0–10%
-    pts_dupe = max(0, round(10 * (1 - min(1.0, dupe_pct * 10))))
-    pts_total += pts_dupe
+        # C1. Duplicate rows (up to -10 pts raw; fixed after cleaning)
+        n_dupes  = int(df_clean.duplicated().sum())
+        dupe_pct = n_dupes / n
+        dupe_pen = round(10 * min(1.0, dupe_pct * 10))
+        if cleaned:
+            pts -= 0            # duplicates removed → no penalty
+        else:
+            pts -= dupe_pen
 
-    # ── 6. Format consistency (0–5 pts) ──────────────────────────────────────
-    pts_fmt = 5
-    if date_col and date_col in df_clean.columns:
-        sample = df_clean[date_col].dropna().astype(str).head(200)
-        fmt_patterns = set()
-        for v in sample:
-            v = v.strip()
-            if _re_s.match(r"\d{4}-\d{2}-\d{2}", v):    fmt_patterns.add("ISO")
-            elif _re_s.match(r"\d{2}/\d{2}/\d{4}", v):  fmt_patterns.add("DMY/")
-            elif _re_s.match(r"\d{2}-\d{2}-\d{4}", v):  fmt_patterns.add("DMY-")
-            elif _re_s.match(r"\d{1,2}/\d{1,2}/\d{2}", v): fmt_patterns.add("short")
-        if len(fmt_patterns) > 1:
-            pts_fmt -= 3
-    cat_col = _resolve("category")
-    if cat_col and cat_col in df_clean.columns:
-        cats = df_clean[cat_col].dropna().astype(str).str.strip()
-        if len(cats.unique()) > len(cats.str.lower().unique()):
-            pts_fmt -= 2
-    pts_fmt = max(0, pts_fmt)
-    pts_total += pts_fmt
+        # C2. Currency-formatted numeric cells (up to -8 pts raw)
+        currency_bad = 0; currency_chk = 0
+        for sf in ["sales", "quantity"]:
+            col = _resolve(sf)
+            if col and col in df_clean.columns:
+                raw = df_clean[col].astype(str)
+                has_curr = raw.str.contains(r"[₹$€£,]", na=False)
+                currency_chk += len(raw)
+                if not cleaned:
+                    currency_bad += int(has_curr.sum())
+        if currency_chk:
+            curr_pen = round(8 * min(1.0, (currency_bad / currency_chk) * 5))
+            pts -= curr_pen if not cleaned else 0
 
-    score = max(0, min(100, pts_total))
+        # C3. Invalid / mixed dates (up to -8 pts raw)
+        date_col = _resolve("date")
+        if date_col and date_col in df_clean.columns:
+            d = df_clean[date_col]
+            blank_d = int(d.isna().sum()) + int((d.astype(str).str.strip() == "").sum())
+            parsed  = _pd_s.to_datetime(d, errors="coerce")
+            bad_d   = max(0, int(parsed.isna().sum()) - blank_d)
+            if not cleaned:
+                date_pen = round(8 * min(1.0, (blank_d + bad_d) / n))
+                pts -= date_pen
+            # mixed formats
+            sample = d.dropna().astype(str).head(200)
+            fmts   = set()
+            for v in sample:
+                v = v.strip()
+                if _re_s.match(r"\d{4}-\d{2}-\d{2}", v):   fmts.add("ISO")
+                elif _re_s.match(r"\d{2}/\d{2}/\d{4}", v): fmts.add("DMY/")
+                elif _re_s.match(r"\d{2}-\d{2}-\d{4}", v): fmts.add("DMY-")
+            if len(fmts) > 1 and not cleaned:
+                pts -= 4
 
+        # C4. Missing product IDs (up to -4 pts raw)
+        prod_col = _resolve("product")
+        if prod_col and prod_col in df_clean.columns:
+            blank_p  = int(df_clean[prod_col].isna().sum()) +                        int((df_clean[prod_col].astype(str).str.strip() == "").sum())
+            if not cleaned and blank_p:
+                pts -= round(4 * min(1.0, blank_p / n * 10))
+
+        return max(0, pts)
+
+    pts_hygiene_raw   = _hygiene_pts(cleaned=False)
+    pts_hygiene_clean = _hygiene_pts(cleaned=True)
+
+    # ── Component D: Mapping Confidence (10 pts) ──────────────────────────
+    # Same before and after — mapping quality is structural.
+    try:
+        mapped_opt = [f for f in _DRC_OPTIONAL if mapping.get(f)]
+    except Exception:
+        mapped_opt = []
+    _opt_bonus  = min(6, len(mapped_opt) * 2)     # up to 6 pts for optional fields
+    _alias_hits = sum(1 for sf in _CRIT_FIELDS
+                      if _resolve(sf) and _resolve(sf) != sf)
+    _alias_bonus = min(4, _alias_hits)              # up to 4 pts for alias matches
+    pts_mapping  = _opt_bonus + _alias_bonus
+
+    # ── Two-stage scores ──────────────────────────────────────────────────
+    raw_score   = max(0, min(100,
+                    pts_struct + pts_complete_raw + pts_hygiene_raw + pts_mapping))
+    final_score = max(0, min(100,
+                    pts_struct + pts_complete_clean + pts_hygiene_clean + pts_mapping))
+
+    # Use final_score for label/colour
+    score = final_score
     if score >= 90:
         label, color, bg = "Ready",                     "#16a34a", "#f0fdf4"
     elif score >= 70:
@@ -5576,18 +5692,28 @@ def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
     else:
         label, color, bg = "Data Improvement Required", "#dc2626", "#fef2f2"
 
-    return score, label, color, bg
+    # Pack component breakdown for UI (show final values)
+    _breakdown = {
+        "Structure Coverage (40)": (pts_struct,          40),
+        "Data Completeness (20)":  (pts_complete_clean,  20),
+        "Data Hygiene (30)":       (pts_hygiene_clean,   30),
+        "Mapping Confidence (10)": (pts_mapping,         10),
+    }
 
-def _render_readiness_score_html(score, label, color, bg, breakdown=None):
+    return raw_score, final_score, label, color, bg, _breakdown
+
+
+def _render_readiness_score_html(raw_score, final_score, label, color, bg, breakdown=None):
     """
-    Render the Data Readiness Score as a polished HTML card.
-    breakdown: optional dict {component_name: pts_earned} for a mini bar-chart.
+    Render the two-stage Data Readiness Score card.
+    Shows: Raw Dataset Score | Final Readiness Score | Improvement delta.
     """
-    # Threshold legend rows
+    improvement = final_score - raw_score
+
     thresholds = [
-        ("#16a34a", "90–100", "Ready"),
-        ("#d97706", "70–89",  "Minor Fixes Needed"),
-        ("#c2520a", "50–69",  "Partial Readiness"),
+        ("#16a34a", "90-100", "Ready"),
+        ("#d97706", "70-89",  "Minor Fixes Needed"),
+        ("#c2520a", "50-69",  "Partial Readiness"),
         ("#dc2626", "< 50",   "Data Improvement Required"),
     ]
     legend_html = "".join(
@@ -5598,7 +5724,72 @@ def _render_readiness_score_html(score, label, color, bg, breakdown=None):
         for c, rng, lbl in thresholds
     )
 
-    # Mini component breakdown bars (if provided)
+    # Two-stage score strip
+    imp_color = "#16a34a" if improvement > 0 else "#64748b"
+    imp_sign  = f"+{improvement}" if improvement > 0 else str(improvement)
+    stage_html = (
+        f"<div style='display:flex;gap:0;margin-bottom:10px;"
+        f"border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;font-family:sans-serif;'>"
+
+        # Raw score
+        f"<div style='flex:1;padding:10px 14px;background:#f8fafc;border-right:1px solid #e2e8f0;'>"
+        f"<div style='font-size:9px;font-weight:700;letter-spacing:0.7px;text-transform:uppercase;"
+        f"color:#94a3b8;margin-bottom:3px;'>Raw Dataset Score</div>"
+        f"<div style='font-size:26px;font-weight:900;color:#475569;line-height:1;"
+        f"font-family:monospace;'>{raw_score}"
+        f"<span style='font-size:11px;font-weight:500;color:#94a3b8;'>/100</span></div>"
+        f"<div style='font-size:9px;color:#94a3b8;margin-top:2px;'>Before cleaning</div>"
+        f"</div>"
+
+        # Arrow
+        f"<div style='display:flex;align-items:center;padding:0 8px;"
+        f"background:#f1f5f9;color:#94a3b8;font-size:16px;'>&#8594;</div>"
+
+        # Final score
+        f"<div style='flex:1;padding:10px 14px;background:{bg};border-right:1px solid #e2e8f0;'>"
+        f"<div style='font-size:9px;font-weight:700;letter-spacing:0.7px;text-transform:uppercase;"
+        f"color:{color};margin-bottom:3px;'>After Cleaning Score</div>"
+        f"<div style='font-size:26px;font-weight:900;color:{color};line-height:1;"
+        f"font-family:monospace;'>{final_score}"
+        f"<span style='font-size:11px;font-weight:500;color:{color}88;'>/100</span></div>"
+        f"<div style='font-size:9px;color:{color};font-weight:600;margin-top:2px;'>{label}</div>"
+        f"</div>"
+
+        # Improvement delta
+        f"<div style='flex:0 0 auto;padding:10px 14px;background:{'#f0fdf4' if improvement > 0 else '#f8fafc'};"
+        f"display:flex;flex-direction:column;align-items:center;justify-content:center;'>"
+        f"<div style='font-size:9px;font-weight:700;letter-spacing:0.7px;text-transform:uppercase;"
+        f"color:{imp_color};margin-bottom:3px;'>Improvement</div>"
+        f"<div style='font-size:22px;font-weight:900;color:{imp_color};"
+        f"font-family:monospace;'>{imp_sign}</div>"
+        f"<div style='font-size:9px;color:{imp_color};margin-top:2px;'>points</div>"
+        f"</div>"
+
+        f"</div>"
+    )
+
+    # Explanation line (only when there is an improvement)
+    explain_html = ""
+    if improvement > 0:
+        explain_html = (
+            f"<div style='font-size:10px;color:#475569;padding:6px 10px;"
+            f"background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;"
+            f"margin-bottom:10px;line-height:1.5;'>"
+            f"<span style='color:#16a34a;font-weight:700;'>&#10003; Improvement driven by: </span>"
+            f"duplicate removal, date standardisation, currency cleanup, "
+            f"and missing identifier recovery."
+            f"</div>"
+        )
+
+    # Progress bar (final score)
+    bar_html = (
+        f"<div style='height:8px;background:#e2e8f0;border-radius:4px;"
+        f"overflow:hidden;margin-bottom:8px;'>"
+        f"<div style='height:100%;width:{final_score}%;background:{color};"
+        f"border-radius:4px;'></div></div>"
+    )
+
+    # Breakdown bars
     breakdown_html = ""
     if breakdown:
         bars = []
@@ -5618,7 +5809,7 @@ def _render_readiness_score_html(score, label, color, bg, breakdown=None):
         breakdown_html = (
             "<div style='border-top:1px solid #e2e8f0;margin-top:10px;padding-top:8px;'>"
             "<div style='font-size:9px;font-weight:700;letter-spacing:0.8px;"
-            "text-transform:uppercase;color:#94a3b8;margin-bottom:6px;'>Quality Score Breakdown</div>"
+            "text-transform:uppercase;color:#94a3b8;margin-bottom:6px;'>Score Breakdown (after cleaning)</div>"
             + "".join(bars) + "</div>"
         )
 
@@ -5626,46 +5817,30 @@ def _render_readiness_score_html(score, label, color, bg, breakdown=None):
         f"<div style='margin:0 0 12px;padding:14px 16px;background:{bg};"
         f"border:1.5px solid {color}33;border-radius:10px;'>"
 
-        # ── Top row: big score + label + legend ──
-        f"<div style='display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;'>"
-
-        # Score number
-        f"<div style='min-width:120px;'>"
         f"<div style='font-size:9.5px;font-weight:700;letter-spacing:0.9px;"
-        f"text-transform:uppercase;color:{color};margin-bottom:3px;'>Dataset Quality Assessment</div>"
-        f"<div style='font-size:38px;font-weight:900;color:{color};"
-        f"line-height:1;font-family:monospace;letter-spacing:-1px;'>"
-        f"{score}"
-        f"<span style='font-size:15px;font-weight:600;color:{color}88;'> / 100</span>"
-        f"</div>"
-        f"<div style='font-size:9px;color:#7A92AA;margin-top:2px;'>Trailing 12-month average</div>"
-        f"<div style='font-size:11px;color:{color};font-weight:600;margin-top:3px;'>Status: {label}</div>"
-        f"</div>"
+        f"text-transform:uppercase;color:{color};margin-bottom:8px;'>"
+        f"Dataset Quality Assessment</div>"
 
-        # Progress bar + status badge
-        f"<div style='flex:1;min-width:180px;padding-top:4px;'>"
-        f"<div style='height:10px;background:#e2e8f0;border-radius:5px;"
-        f"overflow:hidden;margin-bottom:8px;'>"
-        f"<div style='height:100%;width:{score}%;background:{color};"
-        f"border-radius:5px;'></div></div>"
+        + stage_html
+        + explain_html
+        + bar_html
+
+        + f"<div style='display:flex;gap:16px;flex-wrap:wrap;'>"
+        f"<div style='flex:1;min-width:180px;'>"
         f"<div style='display:inline-flex;align-items:center;gap:6px;"
         f"padding:4px 14px;border-radius:20px;"
         f"background:{color}15;border:1.5px solid {color}33;'>"
         f"<span style='width:7px;height:7px;border-radius:50%;background:{color};"
         f"flex-shrink:0;'></span>"
         f"<span style='font-size:12px;font-weight:700;color:{color};'>{label}</span>"
-        f"</div>"
-        f"</div>"
-
-        # Threshold legend
+        f"</div></div>"
         f"<div style='min-width:180px;'>{legend_html}</div>"
+        f"</div>"
 
-        f"</div>"  # end top row
-
-        + breakdown_html +
-
-        f"</div>"  # end outer card
+        + breakdown_html
+        + f"</div>"
     )
+
 
 def run_readiness_check(file_obj):
     """
@@ -5929,9 +6104,8 @@ def run_readiness_check(file_obj):
     quality_html = _drc_quality_findings_html(findings)
 
     # ── Data Readiness Score ──────────────────────────────────────────────────
-    _score, _label, _score_color, _score_bg = _calculate_readiness_score(
-        df_clean, mapping, findings, n_rows
-    )
+    _raw_score, _score, _label, _score_color, _score_bg, _score_breakdown_new = \
+        _calculate_readiness_score(df_clean, mapping, findings, n_rows)
     # Build a component breakdown for the visual bar chart in the score card
     _score_breakdown = {
         "Column completeness":   (min(30, max(0, 30 - (len(_DRC_CRITICAL) - len(mapped_crit)) * 6)), 30),
@@ -6020,8 +6194,9 @@ def run_readiness_check(file_obj):
         "Duplicate Records (10)":    (_dup, 10),
         "Format Consistency (5)":    (_fp,   5),
     }
-    score_html = _render_readiness_score_html(_score, _label, _score_color, _score_bg,
-                                               breakdown=_score_breakdown)
+    score_html = _render_readiness_score_html(_raw_score, _score, _label,
+                                               _score_color, _score_bg,
+                                               breakdown=_score_breakdown_new)
     # ── Completeness check ───────────────────────────────────────────────────
     _comp_pct, _comp_label, _comp_color, _comp_warn, _completeness_html = (
         _drc_completeness_check(df_clean, mapping)
@@ -6031,52 +6206,15 @@ def run_readiness_check(file_obj):
     _auth_flags, _authenticity_html = _drc_authenticity_check(df_clean, mapping)
 
     # ── Transformation summary ───────────────────────────────────────────────
-    _transform_html = _drc_transformation_summary(df_clean, mapping)
-    # ── Quality improvement badge (UI only — always appended) ──────────────
-    _score_approx_before = max(0, _score - _dup - _fp)
-    try:
-        if _score > _score_approx_before and _score >= 50:
-            # Case 1: Score improved — show delta badge
-            _improve_pts = _score - _score_approx_before
-            _badge_col   = "#16a34a" if _score >= 70 else "#d97706"
-            _badge_bg    = "#f0fdf4" if _score >= 70 else "#fffceb"
-            _badge_bdr   = "#bbf7d0" if _score >= 70 else "#fde68a"
-            _badge_html  = (
-                f"<div style='margin-top:10px;padding:8px 12px;"
-                f"background:{_badge_bg};"
-                f"border:1px solid {_badge_bdr};border-radius:6px;"
-                f"display:flex;align-items:center;gap:10px;'>"
-                f"<span style='font-size:16px;'>✨</span>"
-                f"<div>"
-                f"<div style='font-size:11px;font-weight:700;color:{_badge_col};'>"
-                f"Data Quality Improved</div>"
-                f"<div style='font-size:10px;color:#64748b;'>"
-                f"Score: {_score_approx_before} → {_score} "
-                f"(+{_improve_pts} points after automatic cleaning)</div>"
-                f"</div></div>"
-            )
-        else:
-            # Case 2: No cleaning improvement detected
-            _badge_html = (
-                "<div style='margin-top:10px;padding:8px 12px;"
-                "background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"
-                "display:flex;align-items:center;gap:8px;'>"
-                "<span style='font-size:14px;'>✅</span>"
-                "<div style='font-size:11px;color:#475569;'>"
-                "No additional cleaning improvement required — dataset is already well-structured."
-                "</div></div>"
-            )
-    except Exception:
-        # Case 3: Comparison could not be computed
-        _badge_html = (
-            "<div style='margin-top:10px;padding:8px 12px;"
-            "background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"
-            "font-size:11px;color:#94a3b8;'>"
-            "Score comparison unavailable for this dataset."
-            "</div>"
-        )
-    # Always append badge inside the transform card closing </div>
-    _transform_html = _transform_html[:-6] + _badge_html + "</div>"
+    # Run cleaning to get actual stats (READ-ONLY — df_clean not modified)
+    _df_cleaned_preview = apply_cleaning_rules(df_clean)
+    _clean_stats = _df_cleaned_preview.attrs.get("_clean_stats", {})
+    _transform_html = _drc_transformation_summary(
+        df_clean, mapping,
+        raw_score=_raw_score, final_score=_score, final_label=_label,
+        clean_stats=_clean_stats
+    )
+
 
     # ── Ordered assembly of quality_html panels ──────────────────────────────
     # NEW ORDER (per UI spec):
@@ -6133,7 +6271,8 @@ def run_readiness_check(file_obj):
         f"📄  Rows: {n_rows:,}   |   Columns detected: {len(df_norm.columns)}",
         f"✅  Mapped fields: {len(mapped_crit)+len(mapped_opt)} / {len(_DRC_CRITICAL)+len(_DRC_OPTIONAL)}",
         f"📌  Critical fields mapped: {len(mapped_crit)} / {len(_DRC_CRITICAL)}",
-        f"🎯  Data Readiness Score: {_score} / 100 — {_label}",
+        f"🎯  Raw Dataset Score:     {_raw_score} / 100",
+        f"✨  After Cleaning Score:  {_score} / 100 — {_label} (+{_score - _raw_score} improvement)",
         f"📋  Dataset Completeness: {_comp_pct}% — {_comp_label}",
     ]
     if missing_crit:
@@ -6158,6 +6297,279 @@ def run_readiness_check(file_obj):
 
 def export_clean_dataset(df_clean):
     """
+    Apply full cleaning rules and export to a formatted, pivot-ready Excel file.
+    Cleaning is applied before export only — validation report is unchanged.
+    """
+    if df_clean is None:
+        return None
+    df_out = apply_cleaning_rules(df_clean)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx",
+                                           prefix="DataNetra_Cleaned_Dataset_")
+    tmp.close()
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+            df_out.to_excel(writer, index=False, sheet_name="Cleaned_Data")
+            ws = writer.sheets["Cleaned_Data"]
+            # Header row formatting
+            hdr_fill = PatternFill("solid", fgColor="0B1F3A")
+            hdr_font = Font(bold=True, color="FFFFFF", size=11)
+            hdr_align = Alignment(horizontal="center", vertical="center")
+            for cell in ws[1]:
+                cell.fill = hdr_fill
+                cell.font = hdr_font
+                cell.alignment = hdr_align
+            # Auto-fit column widths
+            for col_idx, col in enumerate(df_out.columns, 1):
+                max_len = max(
+                    len(str(col)),
+                    df_out[col].astype(str).str.len().max() if len(df_out) else 0
+                )
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 40)
+            # Freeze header row
+            ws.freeze_panes = "A2"
+            # Add auto-filter
+            ws.auto_filter.ref = ws.dimensions
+            # Alternate row shading
+            row_fill = PatternFill("solid", fgColor="EEF4FB")
+            for row_idx in range(2, ws.max_row + 1, 2):
+                for cell in ws[row_idx]:
+                    if cell.fill.fgColor.rgb == "00000000":
+                        cell.fill = row_fill
+    except Exception:
+        df_out.to_excel(tmp.name, index=False)  # fallback: plain export
+    return tmp.name
+
+def apply_cleaning_rules(df_clean):
+    """
+    Full production-grade cleaning for downloadable Excel export.
+    Returns a new fully-cleaned DataFrame — original is never mutated.
+
+    Rules:
+      1.  Column names → lowercase_with_underscores
+      2.  Dates → YYYY-MM-DD (all valid formats; unparseable → NaT → dropped)
+      3.  Numeric fields: ₹5,000 / 1.2K / 28.5k / "3000" → float
+      4.  Category normalisation → canonical title-case canonical set
+      5.  Duplicate rows (exact) → first kept
+      6.  Missing critical rows (date / product / sales) → dropped
+      7.  Missing product ID → AUTO_SKU_NNN
+      8.  Missing category → "Unknown"
+      9.  ONDC flag → yes / no / NaN
+      10. Ensure all numeric columns are true float dtype in output
+    """
+    import re as _re_cl
+    import numpy as _np_cl
+    df = df_clean.copy()
+
+    # ── 0. Column names → lowercase_with_underscores ──────────────────────
+    def _norm_col(c):
+        c = str(c).strip()
+        c = _re_cl.sub(r"\s+", "_", c).lower()
+        c = _re_cl.sub(r"[^\w]", "_", c)
+        c = _re_cl.sub(r"_+", "_", c).strip("_")
+        return c
+    df.columns = [_norm_col(c) for c in df.columns]
+
+    # ── 1. DATE NORMALISATION → YYYY-MM-DD ───────────────────────────────
+    _date_aliases = ["date","invoice_date","txn_date","sales_date","order_date",
+                     "bill_date","transaction_date","trans_date"]
+    date_col = next((c for c in _date_aliases if c in df.columns), None)
+    n_dates_fixed = 0
+    if date_col:
+        orig = df[date_col].copy()
+        parsed = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        df[date_col] = parsed.dt.strftime("%Y-%m-%d").where(parsed.notna(), other=None)
+        n_dates_fixed = int((orig.astype(str) != df[date_col].fillna("")).sum())
+        # Drop rows where date is completely unparseable (NaT)
+        df = df[df[date_col].notna()].copy()
+
+    # ── 2. NUMERIC CLEANING ───────────────────────────────────────────────
+    # Handles: ₹5,000 / $1.2K / 28.5k / "3,000" / "Rs.500" / percentages
+    _num_aliases = [
+        "sales","revenue","gross_sales","sales_amount","amount","turnover",
+        "net_sales","total_sales","sale_value","invoice_value","bill_amount",
+        "total_amount","cost","cost_price","unit_cost","purchase_price",
+        "buying_price","cogs","landed_cost","cost_per_unit",
+        "qty","quantity","units","units_sold","sold_qty","sales_qty",
+        "inventory_level","inventory","stock","stock_level",
+        "returns","return_rate_pct","returned_qty","qty_returned",
+        "gross_margin_pct","margin","margin_pct","profit_margin_pct",
+        "monthly_demand_units","replacement_units","fulfillment_rate",
+        "reorder_point","stock_level",
+    ]
+    def _to_num(series):
+        s = series.astype(str).str.strip()
+        s = s.str.replace(r"[₹$€£]", "", regex=True)
+        s = s.str.replace(r"Rs\.?\s*", "", regex=True)
+        s = s.str.replace(",", "", regex=False)
+        s = s.str.replace(r"\s+", "", regex=True)
+        # Handle k/K (thousands) and M/m (millions)
+        def _parse_k(v):
+            v = v.strip()
+            if not v or v.lower() in ("nan","none","null",""): return _np_cl.nan
+            try:
+                if v.lower().endswith("k"):
+                    return float(v[:-1]) * 1_000
+                if v.lower().endswith("m"):
+                    return float(v[:-1]) * 1_000_000
+                # strip trailing % for percentage columns
+                v2 = v.rstrip("%")
+                return float(v2)
+            except Exception:
+                return _np_cl.nan
+        return s.apply(_parse_k)
+
+    n_currency_fixed = 0
+    for col in _num_aliases:
+        if col not in df.columns: continue
+        raw = df[col].astype(str)
+        has_noise = raw.str.contains(r"[₹$€£,kKmM]|Rs", regex=True, na=False)
+        numeric = _to_num(df[col])
+        df[col] = numeric
+        n_currency_fixed += int(has_noise.sum())
+
+    # ── 3. CATEGORY NORMALISATION ─────────────────────────────────────────
+    _CANONICAL_CATS = {
+        # Electronics & Tech
+        "electronics": "Electronics",
+        "electronic": "Electronics",
+        "gadgets": "Electronics",
+        "tech": "Electronics",
+        "technology": "Electronics",
+        "mobile": "Electronics",
+        "mobiles": "Electronics",
+        "computers": "Electronics",
+        # Home Appliances
+        "home appliances": "Home Appliances",
+        "home_appliances": "Home Appliances",
+        "appliances": "Home Appliances",
+        "kitchen": "Home Appliances",
+        "home": "Home Appliances",
+        # Clothing & Apparel
+        "clothing": "Clothing",
+        "clothes": "Clothing",
+        "apparel": "Clothing",
+        "garments": "Clothing",
+        "fashion": "Clothing",
+        "textile": "Clothing",
+        "textiles": "Clothing",
+        "footwear": "Clothing",
+        # Grocery & FMCG
+        "grocery": "Grocery & FMCG",
+        "groceries": "Grocery & FMCG",
+        "fmcg": "Grocery & FMCG",
+        "food": "Grocery & FMCG",
+        "food & beverage": "Grocery & FMCG",
+        "food and beverage": "Grocery & FMCG",
+        "beverages": "Grocery & FMCG",
+        "staples": "Grocery & FMCG",
+        # Personal Care
+        "personal care": "Personal Care",
+        "personal_care": "Personal Care",
+        "beauty": "Personal Care",
+        "health": "Personal Care",
+        "healthcare": "Personal Care",
+        "cosmetics": "Personal Care",
+        "hygiene": "Personal Care",
+        # Furniture & Home Decor
+        "furniture": "Furniture & Home Decor",
+        "home decor": "Furniture & Home Decor",
+        "decor": "Furniture & Home Decor",
+        "stationery": "Stationery",
+        "office supplies": "Stationery",
+        "sports": "Sports & Fitness",
+        "fitness": "Sports & Fitness",
+        "toys": "Toys & Games",
+        "games": "Toys & Games",
+        "automotive": "Automotive",
+        "hardware": "Hardware & Tools",
+        "tools": "Hardware & Tools",
+    }
+    _cat_aliases = ["category","product_category","item_group","group_name",
+                    "department","cat","prod_cat","item_category"]
+    cat_col = next((c for c in _cat_aliases if c in df.columns), None)
+    if cat_col:
+        def _norm_cat(v):
+            if pd.isna(v) or str(v).strip() == "":
+                return "Unknown"
+            key = str(v).strip().lower()
+            return _CANONICAL_CATS.get(key, str(v).strip().title())
+        df[cat_col] = df[cat_col].apply(_norm_cat)
+
+    # ── 4. EXACT DUPLICATE REMOVAL ────────────────────────────────────────
+    n_before_dedup = len(df)
+    df = df.drop_duplicates(keep="first")
+    n_dupes_removed = n_before_dedup - len(df)
+
+    # ── 5. DROP ROWS WITH MISSING CRITICAL FIELDS ─────────────────────────
+    _critical_checks = {
+        "date":    _date_aliases,
+        "product": ["product","product_name","sku","sku_name","item_name",
+                    "product_id","article","description"],
+        "sales":   ["sales","revenue","gross_sales","sales_amount","amount",
+                    "turnover","net_sales","total_sales"],
+    }
+    for _, aliases in _critical_checks.items():
+        col = next((c for c in aliases if c in df.columns), None)
+        if col:
+            df = df[df[col].notna()].copy()
+            df = df[df[col].astype(str).str.strip() != ""].copy()
+
+    # ── 6. AUTO-FILL MISSING PRODUCT IDs ─────────────────────────────────
+    _prod_aliases = ["product","product_name","sku","sku_name","item_name","product_id"]
+    prod_col = next((c for c in _prod_aliases if c in df.columns), None)
+    n_prod_filled = 0
+    if prod_col:
+        mask = df[prod_col].isna() | (df[prod_col].astype(str).str.strip() == "")
+        n_prod_filled = int(mask.sum())
+        if n_prod_filled:
+            ctr = 1
+            for idx_r in df[mask].index:
+                df.at[idx_r, prod_col] = f"AUTO_SKU_{ctr:03d}"
+                ctr += 1
+
+    # ── 7. FILL MISSING CATEGORY → "Unknown" ─────────────────────────────
+    if cat_col and cat_col in df.columns:
+        miss = df[cat_col].isna() | (df[cat_col].astype(str).str.strip() == "")
+        df.loc[miss, cat_col] = "Unknown"
+
+    # ── 8. ONDC FLAG NORMALISATION ────────────────────────────────────────
+    _ondc_aliases = ["ondc_enabled","ondc_status","ondc","ondc_flag"]
+    ondc_col = next((c for c in _ondc_aliases if c in df.columns), None)
+    if ondc_col:
+        def _norm_ondc(v):
+            if pd.isna(v): return v
+            s = str(v).strip().lower()
+            if s in ("yes","true","1","y","enabled"): return "Yes"
+            if s in ("no","false","0","n","disabled"): return "No"
+            if s.startswith("y"): return "Yes"
+            if s.startswith("n") or s.startswith("f"): return "No"
+            return None
+        df[ondc_col] = df[ondc_col].apply(_norm_ondc)
+
+    # ── 9. ENFORCE NUMERIC DTYPES ─────────────────────────────────────────
+    for col in _num_aliases:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # ── 10. RESET INDEX ────────────────────────────────────────────────────
+    df = df.reset_index(drop=True)
+
+    # Attach cleaning stats as DataFrame attrs for summary display
+    df.attrs["_clean_stats"] = {
+        "n_dates_fixed":    n_dates_fixed,
+        "n_currency_fixed": n_currency_fixed,
+        "n_dupes_removed":  n_dupes_removed,
+        "n_prod_filled":    n_prod_filled,
+        "n_rows_out":       len(df),
+    }
+    return df
+
+
+def export_clean_dataset(df_clean):
+    """
     Apply automatic cleaning rules then write to a temp xlsx.
     Cleaning is applied before export only — validation report is unchanged.
     """
@@ -6169,118 +6581,6 @@ def export_clean_dataset(df_clean):
     df_out.to_excel(tmp.name, index=False)
     tmp.close()
     return tmp.name
-
-def apply_cleaning_rules(df_clean):
-    """
-    Phase 1.5 — Automatic cleaning for download export.
-    Applies corrections to df_clean WITHOUT touching the validation report.
-    Returns a new cleaned DataFrame. Original df_clean is not mutated.
-
-    Rules applied:
-      1. Date normalisation → YYYY-MM-DD
-      2. Currency / comma stripping in numeric fields
-      3. Non-numeric text in numeric fields → NaN (flagged in report already)
-      4. Missing product identifiers → AUTO_SKU_NNN
-      5. Missing category → "Unknown"
-      6. Invalid ondc_enabled values → normalised yes/no/1/0
-      7. Duplicate rows (date + store_id + product_id) → first kept
-    """
-    import re as _re_cl
-    df = df_clean.copy()
-
-    # ── 1. DATE NORMALISATION ────────────────────────────────────────────────
-    date_col = next((c for c in ["date", "invoice_date", "txn_date",
-                                  "sales_date", "order_date"] if c in df.columns), None)
-    if date_col:
-        def _norm_date(val):
-            if pd.isna(val):
-                return val
-            s = str(val).strip()
-            # Already a datetime → format
-            try:
-                return pd.to_datetime(s, dayfirst=True, errors="raise").strftime("%Y-%m-%d")
-            except Exception:
-                return val  # leave unparseable unchanged
-
-        df[date_col] = df[date_col].apply(_norm_date)
-
-    # ── 2. CURRENCY / COMMA CLEANING in numeric fields ───────────────────────
-    currency_cols = [c for c in ["sales", "revenue", "gross_sales", "sales_amount",
-                                  "amount", "turnover", "total_sales", "cost",
-                                  "cost_price", "unit_cost", "purchase_price"] if c in df.columns]
-    for col in currency_cols:
-        cleaned = (df[col].astype(str)
-                          .str.replace(r"[₹$€£]", "", regex=True)
-                          .str.replace(r"Rs\.?\s*", "", regex=True)
-                          .str.replace(",", "", regex=False)
-                          .str.strip())
-        numeric = pd.to_numeric(cleaned, errors="coerce")
-        # Only overwrite rows that were non-numeric strings (not blanks that became NaN)
-        mask = df[col].notna() & numeric.notna()
-        df.loc[mask, col] = numeric[mask]
-
-    # ── 3. NON-NUMERIC TEXT IN NUMERIC FIELDS → NaN ──────────────────────────
-    numeric_text_cols = [c for c in ["inventory_level", "inventory", "stock",
-                                      "stock_level", "returns", "return_rate_pct",
-                                      "returned_qty", "qty_returned", "quantity",
-                                      "units_sold"] if c in df.columns]
-    for col in numeric_text_cols:
-        coerced = pd.to_numeric(
-            df[col].astype(str).str.replace(r"[,\s%]", "", regex=True),
-            errors="coerce"
-        )
-        # Keep original numeric values; set text-only entries to NaN
-        df[col] = coerced
-
-    # ── 4. MISSING PRODUCT IDENTIFIERS → AUTO_SKU_NNN ───────────────────────
-    prod_col = next((c for c in ["product", "product_name", "sku", "sku_name",
-                                  "item_name", "product_id"] if c in df.columns), None)
-    if prod_col:
-        missing_mask = df[prod_col].isna() | (df[prod_col].astype(str).str.strip() == "")
-        if missing_mask.any():
-            counter = 1
-            new_ids = []
-            for is_missing in missing_mask:
-                if is_missing:
-                    new_ids.append(f"AUTO_SKU_{counter:03d}")
-                    counter += 1
-                else:
-                    new_ids.append(None)
-            # Apply only where missing
-            for i, (is_missing, new_id) in enumerate(zip(missing_mask, new_ids)):
-                if is_missing:
-                    df.at[df.index[i], prod_col] = new_id
-
-    # ── 5. MISSING CATEGORY → "Unknown" ─────────────────────────────────────
-    cat_col = next((c for c in ["category", "product_category", "item_group",
-                                  "group_name", "department"] if c in df.columns), None)
-    if cat_col:
-        missing_cat = df[cat_col].isna() | (df[cat_col].astype(str).str.strip() == "")
-        df.loc[missing_cat, cat_col] = "Unknown"
-
-    # ── 6. ONDC_ENABLED NORMALISATION ───────────────────────────────────────
-    ondc_col = next((c for c in ["ondc_enabled", "ondc_status", "ondc"]
-                     if c in df.columns), None)
-    if ondc_col:
-        def _norm_ondc(val):
-            if pd.isna(val):
-                return val
-            s = str(val).strip().lower()
-            if s in ("yes", "true", "1", "y"):   return "yes"
-            if s in ("no",  "false","0", "n"):   return "no"
-            # Fuzzy: starts with y → yes, starts with n/f → no
-            if s.startswith("y"):  return "yes"
-            if s.startswith("n") or s.startswith("f"): return "no"
-            return None   # truly invalid → NaN
-        df[ondc_col] = df[ondc_col].apply(_norm_ondc)
-
-    # ── 7. DUPLICATE ROWS (date + store_id + product_id) ────────────────────
-    dedup_cols = [c for c in ["date", "store_id", "store", "product_id",
-                               "product", "sku"] if c in df.columns]
-    if len(dedup_cols) >= 2:
-        df = df.drop_duplicates(subset=dedup_cols, keep="first")
-
-    return df
 
 def generate_blank_template():
     """
@@ -8793,20 +9093,25 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                 with gr.Column(visible=False) as _drc_details_panel:
                     gr.HTML("<hr style='margin:8px 0;border:none;border-top:1px solid #e2e8f0;'>")
 
-                    # ── Native Gradio Tabs — no JS, no MutationObserver, no slicing ──
+                    # ── Native Gradio Tabs ──────────────────────────────────────────
+                    # Overview uses a non-empty placeholder so Gradio mounts its DOM
+                    # node immediately — fixes the lazy-render blank-on-first-load bug.
                     with gr.Tabs(selected=0, elem_id="drc-native-tabs"):
                         with gr.Tab("📊 Overview"):
-                            drc_overview_out = gr.HTML(value="", elem_id="drc-overview-content")
+                            drc_overview_out = gr.HTML(
+                                value="<div style='min-height:4px'></div>",
+                                elem_id="drc-overview-content"
+                            )
                         with gr.Tab("🔎 Data Quality"):
-                            drc_quality_out2 = gr.HTML(value="", elem_id="drc-quality-content")
+                            drc_quality_out2 = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-quality-content")
                         with gr.Tab("📐 Structure"):
-                            drc_struct_out   = gr.HTML(value="", elem_id="drc-struct-content")
+                            drc_struct_out   = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-struct-content")
                         with gr.Tab("🛡️ Authenticity"):
-                            drc_auth_out     = gr.HTML(value="", elem_id="drc-auth-content")
+                            drc_auth_out     = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-auth-content")
                         with gr.Tab("🧹 Cleaning"):
-                            drc_clean_out    = gr.HTML(value="", elem_id="drc-clean-content")
+                            drc_clean_out    = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-clean-content")
                         with gr.Tab("🗂️ Field Mapping"):
-                            drc_map_out      = gr.HTML(value="", elem_id="drc-map-content")
+                            drc_map_out      = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-map-content")
 
                     # Hidden source widgets — preserved for handler signature compatibility
                     drc_compact_out  = gr.HTML(elem_id="drc-compact-out",  visible=False)
@@ -8822,9 +9127,8 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                     "<span>Your cleaned dataset includes automatic corrections: normalized dates, removed currency symbols, eliminated duplicates, and auto-filled missing product IDs where possible.</span>"
                     "</div>"
                 )
+                drc_dl_btn   = gr.HTML("", visible=False)
                 with gr.Row():
-                    drc_dl_btn   = gr.File(label="⬇ Download Clean Dataset",
-                                                      visible=False)
                     drc_cont_btn = gr.Button("→ Continue to Analysis",
                                              variant="secondary", interactive=False)
                 drc_cont_note = gr.Markdown(
@@ -8840,6 +9144,35 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
             drc_tmpl_btn.click(fn=_drc_get_template, inputs=[], outputs=[drc_tmpl_file])
 
             # ── Compact KPI strip builder ──────────────────────────────────
+
+
+            def _drc_dl_html(path):
+                """Build a base64 Excel download anchor for the cleaned dataset."""
+                if not path:
+                    return ""
+                try:
+                    import base64 as _b64_dl, os as _os_dl
+                    with open(path, "rb") as _f:
+                        _b64 = _b64_dl.b64encode(_f.read()).decode()
+                    _fname = _os_dl.path.basename(path)
+                    return (
+                        "<div style='margin:8px 0;padding:10px 14px;"
+                        "background:#f0fdf4;border:1px solid #bbf7d0;"
+                        "border-radius:8px;display:flex;align-items:center;gap:10px;'>"
+                        "<span style='font-size:18px;'>📥</span>"
+                        "<a href='data:application/vnd.openxmlformats-officedocument"
+                        ".spreadsheetml.sheet;base64," + _b64 + "'"
+                        " download='" + _fname + "'"
+                        " style='font-size:13px;font-weight:600;color:#166534;"
+                        "text-decoration:none;border-bottom:1px solid #166534;'>"
+                        "Download Cleaned Dataset (.xlsx)</a>"
+                        "<span style='font-size:11px;color:#64748b;margin-left:auto;'>"
+                        "Dates standardised · Duplicates removed · Currency cleaned"
+                        "</span></div>"
+                    )
+                except Exception:
+                    return ""
+
             def _drc_compact_strip(n_rows, n_cols, n_crit, n_warn, status, score=None):
                 sc_color = ("#16a34a" if (score or 0) >= 90 else "#d97706" if (score or 0) >= 70
                             else "#c2520a" if (score or 0) >= 50 else "#dc2626") if score else "#64748b"
@@ -8957,64 +9290,80 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
 
             # ── Main run handler ───────────────────────────────────────────
             def _drc_run_handler(fobj):
-                sh, mh, df_c, summ, qh = run_readiness_check(fobj)
-                path = export_clean_dataset(df_c)
-                # Parse counts for compact strip
-                import re as _re2
-                _m_rows = _re2.search(r"Rows: ([\d,]+)", summ)
-                n_rows = int(_m_rows.group(1).replace(",","")) if _m_rows else 0
-                _m_cols = _re2.search(r"Columns detected: (\d+)", summ)
-                n_cols = int(_m_cols.group(1)) if _m_cols else 0
-                n_crit2 = qh.count("❌ Critical") + qh.count("Critical</div>")
-                n_warn2 = qh.count("⚠️ Warnings") + qh.count("Warnings</div>")
-                status = ("Ready" if "Ready" in sh else
-                          "Partial" if "Partial" in sh else
-                          "Needs Completion" if "Needs" in sh else "")
-                _m_score = _re2.search(r"Data Readiness Score: (\d+) / 100", summ)
-                _score_val = int(_m_score.group(1)) if _m_score else None
-                compact = _drc_compact_strip(n_rows, n_cols, n_crit2, n_warn2, status, _score_val)
-                # ── Split quality_html by section markers into 6 native tab panels ──
-                _MARKERS = ["<!--DRC_OVERVIEW-->","<!--DRC_QUALITY-->","<!--DRC_STRUCTURE-->",
-                            "<!--DRC_AUTH-->","<!--DRC_CLEANING-->","<!--DRC_MAPPING-->"]
-                def _split_qh(html):
-                    parts = {}
-                    for i, marker in enumerate(_MARKERS):
-                        next_marker = _MARKERS[i+1] if i+1 < len(_MARKERS) else None
-                        s = html.find(marker)
-                        if s < 0: parts[marker] = ""; continue
-                        s += len(marker)
-                        e = html.find(next_marker, s) if next_marker else len(html)
-                        parts[marker] = html[s:e] if e >= s else html[s:]
-                    return parts
-                _p = _split_qh(qh)
-                # Overview tab = compact strip (score card) + score html + summary log
-                _overview_html = (
-                    compact +
-                    "<details open style='margin-top:10px;'>"
-                    "<summary style='font-size:11px;font-weight:700;color:#1B4F8A;cursor:pointer;"
-                    "letter-spacing:0.3px;'>📝 Validation Log</summary>"
-                    "<pre style='font-size:11px;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;"
-                    "border-radius:6px;padding:8px 10px;white-space:pre-wrap;word-break:break-word;"
-                    "line-height:1.5;max-height:160px;overflow-y:auto;margin:6px 0 0;'>"
-                    + summ.replace("<","&lt;").replace(">","&gt;") + "</pre></details>"
-                    + _p.get("<!--DRC_OVERVIEW-->","")
-                )
-                return (
-                    sh,                                    # drc_status_out
-                    compact,                               # drc_compact_out (hidden)
-                    mh,                                    # drc_mapping_out (hidden)
-                    summ,                                  # drc_summary_out (hidden)
-                    qh,                                    # drc_quality_out (hidden)
-                    path,                                  # _drc_clean_state
-                    path,                                  # drc_dl_btn
-                    gr.update(visible=True),               # _drc_results
-                    _overview_html,                        # drc_overview_out
-                    _p.get("<!--DRC_QUALITY-->",""),       # drc_quality_out2
-                    _p.get("<!--DRC_STRUCTURE-->",""),     # drc_struct_out
-                    _p.get("<!--DRC_AUTH-->",""),          # drc_auth_out
-                    _p.get("<!--DRC_CLEANING-->",""),      # drc_clean_out
-                    _p.get("<!--DRC_MAPPING-->",""),       # drc_map_out
-                )
+                try:
+                    sh, mh, df_c, summ, qh = run_readiness_check(fobj)
+                    path = export_clean_dataset(df_c)
+                    import re as _re2
+                    _m_rows = _re2.search(r"Rows: ([\d,]+)", summ)
+                    n_rows = int(_m_rows.group(1).replace(",","")) if _m_rows else 0
+                    _m_cols = _re2.search(r"Columns detected: (\d+)", summ)
+                    n_cols = int(_m_cols.group(1)) if _m_cols else 0
+                    n_crit2 = qh.count("\u274c Critical") + qh.count("Critical</div>")
+                    n_warn2 = qh.count("\u26a0\ufe0f Warnings") + qh.count("Warnings</div>")
+                    status = ("Ready" if "Ready" in sh else
+                              "Partial" if "Partial" in sh else
+                              "Needs Completion" if "Needs" in sh else "")
+                    _m_score = _re2.search(r"After Cleaning Score:\s*(\d+) / 100", summ)
+                    _score_val = int(_m_score.group(1)) if _m_score else None
+                    compact = _drc_compact_strip(n_rows, n_cols, n_crit2, n_warn2, status, _score_val)
+                    _MARKERS = ["<!--DRC_OVERVIEW-->","<!--DRC_QUALITY-->","<!--DRC_STRUCTURE-->",
+                                "<!--DRC_AUTH-->","<!--DRC_CLEANING-->","<!--DRC_MAPPING-->"]
+                    def _split_qh(html):
+                        parts = {}
+                        for i, marker in enumerate(_MARKERS):
+                            next_marker = _MARKERS[i+1] if i+1 < len(_MARKERS) else None
+                            s = html.find(marker)
+                            if s < 0: parts[marker] = ""; continue
+                            s += len(marker)
+                            e = html.find(next_marker, s) if next_marker else len(html)
+                            parts[marker] = html[s:e] if e >= s else html[s:]
+                        return parts
+                    _p = _split_qh(qh)
+                    _overview_html = (
+                        compact +
+                        "<details open style='margin-top:10px;'>"
+                        "<summary style='font-size:11px;font-weight:700;color:#1B4F8A;cursor:pointer;"
+                        "letter-spacing:0.3px;'>\U0001f4dd Validation Log</summary>"
+                        "<pre style='font-size:11px;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;"
+                        "border-radius:6px;padding:8px 10px;white-space:pre-wrap;word-break:break-word;"
+                        "line-height:1.5;max-height:160px;overflow-y:auto;margin:6px 0 0;'>"
+                        + summ.replace("<","&lt;").replace(">","&gt;") + "</pre></details>"
+                        + _p.get("<!--DRC_OVERVIEW-->","")
+                    )
+                    return (
+                        sh,
+                        compact,
+                        mh,
+                        summ,
+                        qh,
+                        path,
+                        gr.update(value=_drc_dl_html(path), visible=bool(path)),
+                        gr.update(visible=True),
+                        _overview_html,
+                        _p.get("<!--DRC_QUALITY-->",""),
+                        _p.get("<!--DRC_STRUCTURE-->",""),
+                        _p.get("<!--DRC_AUTH-->",""),
+                        _p.get("<!--DRC_CLEANING-->",""),
+                        _p.get("<!--DRC_MAPPING-->",""),
+                    )
+                except Exception as _drc_err:
+                    import traceback as _drc_tb
+                    _etb = _drc_tb.format_exc()
+                    _emsg = str(_drc_err).replace("<","&lt;").replace(">","&gt;")
+                    _err_html = (
+                        "<div style='padding:12px;background:#fee2e2;border:1px solid #fca5a5;"
+                        "border-radius:8px;font-size:12px;color:#dc2626;'>"
+                        "<strong>\u274c Data Check Error:</strong> " + _emsg
+                        + "<br><pre style='font-size:10px;color:#7f1d1d;margin-top:6px;'>"
+                        + _etb.replace("<","&lt;").replace(">","&gt;")[-1200:]
+                        + "</pre></div>"
+                    )
+                    return (
+                        _err_html, "", "", str(_drc_err), "",
+                        None, gr.update(value="", visible=False),
+                        gr.update(visible=True),
+                        _err_html, "", "", "", "", "",
+                    )
 
             drc_run.click(
                 fn=_drc_run_handler,
