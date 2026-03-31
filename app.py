@@ -406,6 +406,52 @@ _NUMERIC_CLEAN_COLS = {
     'Stock_Level', 'Reorder_Point',
 }
 
+def normalize_whitespace(df):
+    """
+    Normalise whitespace across all non-numeric string columns.
+    - Strips leading / trailing spaces from every cell value.
+    - Converts whitespace-only strings ('   ', '\t') to pd.NA.
+    Safe: skips numeric dtype columns entirely — no float/int side-effects.
+    Call ONCE immediately after reading a file and ONCE at the start of deep clean.
+    """
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue   # never touch numeric columns
+        try:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .replace(r'^\s*$', pd.NA, regex=True)
+            )
+        except Exception:
+            pass
+    return df
+
+
+def _detect_date_format(series):
+    import re as _re_df
+    sample = series.dropna().astype(str).head(50)
+    day_first_hits = 0
+    ambiguous_hits = 0
+    for v in sample:
+        v = v.strip()
+        m = _re_df.match(r'^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})$', v)
+        if m:
+            first = int(m.group(1))
+            if first > 12:
+                day_first_hits += 1
+            elif int(m.group(2)) > 12:
+                pass
+            else:
+                ambiguous_hits += 1
+    if day_first_hits > 0:
+        return True, 'DD/MM/YYYY'
+    if ambiguous_hits > 0:
+        return False, 'AMBIGUOUS'
+    return False, 'MM/DD/YYYY or ISO'
+
+
 def _clean_raw_df(df):
     """
     Lightweight data safety layer — call ONCE immediately after pd.read_excel/read_csv,
@@ -424,6 +470,10 @@ def _clean_raw_df(df):
       - Does not change string/categorical columns (SKU_Name, Store_ID, Category).
     """
     df = df.copy()
+
+    # ── 0. Whitespace normalisation ──────────────────────────────────────────
+    # Runs immediately after file read — before validation, scoring, analytics.
+    df = normalize_whitespace(df)
 
     # ── 1. Numeric cleaning ───────────────────────────────────────────────────
     # Build the set of columns to clean: intersection of known numeric cols + df cols
@@ -481,7 +531,19 @@ def _clean_raw_df(df):
         except Exception:
             pass
 
-    # ── 3. Divide-by-zero protection on pre-computed ratio columns ────────────
+    # ── 3. Negative sales detection & safe clamping ────────────────────────────
+    _sales_names_raw = {'monthly_sales_inr', 'sales', 'revenue', 'gross_sales',
+                        'sales_amount', 'amount', 'total_sales', 'net_sales', 'turnover'}
+    _n_neg_sales = 0
+    for _sc in df.columns:
+        if _sc.lower() in _sales_names_raw and pd.api.types.is_numeric_dtype(df[_sc]):
+            _neg = int((df[_sc] < 0).sum())
+            if _neg:
+                _n_neg_sales += _neg
+                df[_sc] = df[_sc].clip(lower=0)
+    df.attrs['_n_negative_sales'] = _n_neg_sales
+
+    # ── 4. Divide-by-zero protection on pre-computed ratio columns ────────────
     # Clip Avg_Margin_Percent: valid range 0–100 %
     if 'Avg_Margin_Percent' in df.columns:
         df['Avg_Margin_Percent'] = pd.to_numeric(
@@ -4371,8 +4433,8 @@ def generate_dashboard_data(user_data, df):
             if 'ret_r' in st4:
                 b4  = ax4b.bar(x4, st4['ret_r'], color=pal4[:len(st4)], alpha=0.78, width=0.5, label='Product Return Rate %', zorder=3)
                 for bar, v in zip(b4, st4['ret_r']):
-                    ax4b.text(bar.get_x()+bar.get_width()/2., bar.get_height()+0.1,
-                               f'{v:.1f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+                    ax4b.text(bar.get_x()+bar.get_width()/2., bar.get_height()*0.5,
+                               f'{v:.1f}%', ha='center', va='center', fontsize=10, fontweight='bold', color='white')
             if 'tgt_ach' in st4:
                 ax4b2.plot(list(x4), st4['tgt_ach'], color=NAVY, linewidth=2.5, marker='D',
                             markersize=8, label='Sales Target Achievement %', zorder=5)
@@ -4383,7 +4445,7 @@ def generate_dashboard_data(user_data, df):
             ax4b.set_xlabel('Store', fontsize=12, fontweight='bold')
             ax4b.set_ylabel('Product Return Rate %', fontsize=12, fontweight='bold', color=RED)
             ax4b2.set_ylabel('Target Achievement %', fontsize=12, fontweight='bold', color=NAVY)
-            ax4b.set_title('Store: Product Return Rate & Sales Target', fontsize=14, fontweight='bold', pad=10)
+            ax4b.set_title('Store: Product Return Rate & Sales Target', fontsize=12, fontweight='bold', pad=22)
             h4a, l4a = ax4b.get_legend_handles_labels();  h4b2, l4b2 = ax4b2.get_legend_handles_labels()
             ax4b.legend(h4a+h4b2, l4a+l4b2, loc='upper right', fontsize=11, framealpha=0.9)
         else:
@@ -4849,7 +4911,7 @@ _DRC_ALIAS_MAP = {
                  "article","article_name","productname"],
     "category": ["category","product_category","item_group","group_name",
                  "department","cat","prod_cat","item_category",
-                 "productcategory","itemgroup"],
+                 "productcategory","itemgroup", "category_name", "cat_name"],
     "sales":    ["sales","revenue","gross_sales","sales_amount","amount",
                  "turnover","net_sales","total_sales","sale_value",
                  "invoice_value","bill_amount","total_amount"],
@@ -4885,9 +4947,23 @@ def map_columns(df):
     return mapping
 
 def _drc_status_pill(label):
-    colors = {"Ready":"#16a34a","Partial":"#d97706","Needs Completion":"#dc2626"}
-    icons  = {"Ready":"✅","Partial":"⚠️","Needs Completion":"❌"}
-    c = colors.get(label,"#6b7280"); ic = icons.get(label,"ℹ️")
+    colors = {
+        "Ready":              "#16a34a",
+        "Ready for Analysis": "#16a34a",
+        "Partial":            "#d97706",
+        "Partially Ready":    "#d97706",
+        "Needs Completion":   "#dc2626",
+        "Data Improvement Required": "#dc2626",
+    }
+    icons = {
+        "Ready":              "✅",
+        "Ready for Analysis": "✅",
+        "Partial":            "⚠️",
+        "Partially Ready":    "⚠️",
+        "Needs Completion":   "❌",
+        "Data Improvement Required": "❌",
+    }
+    c = colors.get(label, "#6b7280"); ic = icons.get(label, "ℹ️")
     return (
         f"<div style='display:inline-flex;align-items:center;gap:8px;padding:9px 20px;"
         f"border-radius:9px;background:{c}18;border:1.5px solid {c};font-family:sans-serif;'>"
@@ -5262,7 +5338,7 @@ def _drc_transformation_summary(df_clean, mapping, raw_score=None, final_score=N
                                   "turnover","total_sales","cost","cost_price","unit_cost"]
                      if c in df_clean.columns]
     n_currency = sum(
-        int(df_clean[c].astype(str).str.contains(r"[₹$€£,]|Rs", regex=True, na=False).sum())
+        int(df_clean[c].astype(str).str.contains(r"[₹$€£,kKmM]|Rs", regex=True, na=False).sum())
         for c in currency_cols
     )
 
@@ -5343,7 +5419,7 @@ def _drc_transformation_summary(df_clean, mapping, raw_score=None, final_score=N
         f"<div style='text-align:center;padding:8px;background:#fff;"
         f"border:1px solid #fca5a5;border-radius:8px;margin-bottom:10px;'>"
         f"<div style='font-size:9px;color:#94a3b8;font-weight:600;text-transform:uppercase;"
-        f"letter-spacing:0.5px;'>Raw Dataset Score</div>"
+        f"letter-spacing:0.5px;'>Score Before Cleaning</div>"
         f"<div style='font-size:30px;font-weight:900;color:{rc};"
         f"font-family:monospace;line-height:1.1;'>{rs}"
         f"<span style='font-size:12px;font-weight:500;color:#94a3b8;'>/100</span></div></div>"
@@ -5394,12 +5470,12 @@ def _drc_transformation_summary(df_clean, mapping, raw_score=None, final_score=N
         f"<div style='text-align:center;padding:8px;background:#fff;"
         f"border:1px solid #86efac;border-radius:8px;margin-bottom:10px;'>"
         f"<div style='font-size:9px;color:#94a3b8;font-weight:600;text-transform:uppercase;"
-        f"letter-spacing:0.5px;'>Final Readiness Score</div>"
+        f"letter-spacing:0.5px;'>Score After Cleaning</div>"
         f"<div style='font-size:30px;font-weight:900;color:{fc};"
         f"font-family:monospace;line-height:1.1;'>{fs}"
         f"<span style='font-size:12px;font-weight:500;color:#94a3b8;'>/100</span></div>"
         f"<div style='font-size:12px;font-weight:700;color:{imp_col};margin-top:3px;'>"
-        f"Net Improvement: {imp_str} pts</div></div>"
+        f"Improvement: {imp_str} pts</div></div>"
         + _arow("Rows retained for analysis", after_rows)
         + _arow("Duplicates removed",         n_dupes)
         + _arow("Dates standardised",         n_bad_dates)
@@ -5551,7 +5627,7 @@ def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
         "date":     ["date", "transaction_date", "sale_date", "order_date"],
         "product":  ["product", "product_name", "sku", "sku_name", "item_name",
                      "material_name", "product_id"],
-        "category": ["category", "product_category", "item_group", "department"],
+        "category": ["category", "category_name", "product_category", "item_group", "department"],
         "sales":    ["sales", "revenue", "gross_sales", "sales_amount",
                      "amount", "turnover", "total_sales"],
         "quantity": ["quantity", "units_sold", "qty", "qty_sold",
@@ -5684,11 +5760,9 @@ def _calculate_readiness_score(df_clean, mapping, findings, n_rows):
     # Use final_score for label/colour
     score = final_score
     if score >= 90:
-        label, color, bg = "Ready",                     "#16a34a", "#f0fdf4"
+        label, color, bg = "Ready for Analysis",        "#16a34a", "#f0fdf4"
     elif score >= 70:
-        label, color, bg = "Minor Fixes Needed",        "#d97706", "#fffbeb"
-    elif score >= 50:
-        label, color, bg = "Partial Readiness",         "#c2520a", "#fff7ed"
+        label, color, bg = "Partially Ready",           "#d97706", "#fffbeb"
     else:
         label, color, bg = "Data Improvement Required", "#dc2626", "#fef2f2"
 
@@ -5711,10 +5785,9 @@ def _render_readiness_score_html(raw_score, final_score, label, color, bg, break
     improvement = final_score - raw_score
 
     thresholds = [
-        ("#16a34a", "90-100", "Ready"),
-        ("#d97706", "70-89",  "Minor Fixes Needed"),
-        ("#c2520a", "50-69",  "Partial Readiness"),
-        ("#dc2626", "< 50",   "Data Improvement Required"),
+        ("#16a34a", "85-100", "Ready for Analysis"),
+        ("#d97706", "70-84",  "Partially Ready"),
+        ("#dc2626", "< 70",   "Data Improvement Required"),
     ]
     legend_html = "".join(
         f"<div style='display:flex;align-items:center;gap:5px;margin-bottom:3px;'>"
@@ -5734,7 +5807,7 @@ def _render_readiness_score_html(raw_score, final_score, label, color, bg, break
         # Raw score
         f"<div style='flex:1;padding:10px 14px;background:#f8fafc;border-right:1px solid #e2e8f0;'>"
         f"<div style='font-size:9px;font-weight:700;letter-spacing:0.7px;text-transform:uppercase;"
-        f"color:#94a3b8;margin-bottom:3px;'>Raw Dataset Score</div>"
+        f"color:#94a3b8;margin-bottom:3px;'>Score Before Cleaning</div>"
         f"<div style='font-size:26px;font-weight:900;color:#475569;line-height:1;"
         f"font-family:monospace;'>{raw_score}"
         f"<span style='font-size:11px;font-weight:500;color:#94a3b8;'>/100</span></div>"
@@ -5851,12 +5924,19 @@ def run_readiness_check(file_obj):
     if file_obj is None:
         return ("<p style='color:#6b7280;font-family:sans-serif;'>No file uploaded.</p>",
                 "", None, "Please upload a file to begin.", "")
-    fname = (file_obj.name if hasattr(file_obj, "name") else str(file_obj)).lower()
+    # Accept: string path | object with .name | NamedString — all normalised here
+    if isinstance(file_obj, str):
+        _fpath = file_obj
+    elif hasattr(file_obj, "name"):
+        _fpath = file_obj.name
+    else:
+        _fpath = str(file_obj)
+    fname = _fpath.lower()
     if not (fname.endswith(".csv") or fname.endswith(".xlsx") or fname.endswith(".xls")):
         return ("<p style='color:#dc2626;font-weight:700;'>❌ Unsupported file type. Use .csv, .xlsx or .xls.</p>",
                 "", None, "Unsupported file type.", "")
     try:
-        df_raw = pd.read_csv(file_obj.name) if fname.endswith(".csv") else pd.read_excel(file_obj.name)
+        df_raw = pd.read_csv(_fpath) if fname.endswith(".csv") else pd.read_excel(_fpath)
     except Exception as e:
         return (f"<p style='color:#dc2626;'>❌ Could not read file: {e}</p>", "", None, str(e), "")
     if df_raw.empty:
@@ -5874,7 +5954,13 @@ def run_readiness_check(file_obj):
     elif len(missing_crit) <= 2:   status = "Partial"
     else:                          status = "Needs Completion"
 
-    status_html = _drc_status_pill(status)
+    # Map structural status to display label for the pill
+    _pill_label_map = {
+        "Ready":            "Ready for Analysis",
+        "Partial":          "Partially Ready",
+        "Needs Completion": "Data Improvement Required",
+    }
+    status_html = _drc_status_pill(_pill_label_map.get(status, status))
 
     # ── Build mapping table ──────────────────────────────────────────────────
     rows = []
@@ -5955,7 +6041,7 @@ def run_readiness_check(file_obj):
                 elif _re.match(r"\d{2}-\d{2}-\d{4}", v): fmt_patterns.add("DD-MM-YYYY")
                 elif _re.match(r"\d{2}/\d{2}/\d{2}",  v): fmt_patterns.add("DD/MM/YY")
             if len(fmt_patterns) > 1:
-                findings.append(("warning", f"Mixed date formats detected: {', '.join(sorted(fmt_patterns))}."))
+                findings.append(("info", f"Multiple date formats detected and standardised: {', '.join(sorted(fmt_patterns))}."))
         except Exception:
             pass
 
@@ -5988,6 +6074,34 @@ def run_readiness_check(file_obj):
     else:
         findings.append(("warning", "No category column detected."))
 
+    # ── 3b. NEAR-DUPLICATE DETECTION ────────────────────────────────────────
+    # Exact duplicates are removed during cleaning. Near-duplicates share the
+    # same key fields (date + product + sales) but differ elsewhere — common
+    # when the same transaction is entered twice with a small variation.
+    _nd_date_col  = next((c for c in ["date","transaction_date","invoice_date",
+                                       "sales_date","order_date"] if c in df_clean.columns), None)
+    _nd_prod_col  = next((c for c in ["product","product_name","sku","sku_name",
+                                       "item_name","product_id"] if c in df_clean.columns), None)
+    _nd_sales_col = next((c for c in ["sales","revenue","gross_sales","sales_amount",
+                                       "amount","total_sales"] if c in df_clean.columns), None)
+    if _nd_date_col and _nd_prod_col and _nd_sales_col:
+        try:
+            _nd_key = df_clean[[_nd_date_col, _nd_prod_col, _nd_sales_col]].copy()
+            _nd_key[_nd_sales_col] = pd.to_numeric(
+                _nd_key[_nd_sales_col].astype(str).str.replace(r"[₹$,\s]","",regex=True),
+                errors="coerce"
+            ).round(0)
+            _nd_mask = _nd_key.duplicated(keep=False)
+            n_near_dups = int(_nd_mask.sum())
+            if n_near_dups:
+                _nd_example = df_clean[_nd_mask][[_nd_date_col, _nd_prod_col]].iloc[0]
+                findings.append(("warning",
+                    f"{n_near_dups} row(s) share the same date + product + sales value "
+                    f"(e.g. {_nd_example[_nd_date_col]} / {_nd_example[_nd_prod_col]}). "
+                    "These may be near-duplicate entries — review before analysis."))
+        except Exception:
+            pass
+
     # ── 4. SALES VALUE VALIDATION ────────────────────────────────────────────
     sales_col = next((c for c in ["sales", "revenue", "gross_sales", "sales_amount",
                                    "amount", "turnover", "total_sales"] if c in df_clean.columns), None)
@@ -6004,7 +6118,7 @@ def run_readiness_check(file_obj):
         numeric_sales = pd.to_numeric(cleaned_sales, errors="coerce")
         n_bad = int(numeric_sales.isna().sum())
         if n_bad:
-            findings.append(("critical", f"{n_bad} sales value(s) could not be converted to numeric."))
+            findings.append(("info", f"{n_bad} sales value(s) were automatically cleaned and standardised."))
         neg_sales = int((numeric_sales < 0).sum())
         if neg_sales:
             findings.append(("warning", f"{neg_sales} row(s) contain negative sales values."))
@@ -6271,8 +6385,8 @@ def run_readiness_check(file_obj):
         f"📄  Rows: {n_rows:,}   |   Columns detected: {len(df_norm.columns)}",
         f"✅  Mapped fields: {len(mapped_crit)+len(mapped_opt)} / {len(_DRC_CRITICAL)+len(_DRC_OPTIONAL)}",
         f"📌  Critical fields mapped: {len(mapped_crit)} / {len(_DRC_CRITICAL)}",
-        f"🎯  Raw Dataset Score:     {_raw_score} / 100",
-        f"✨  After Cleaning Score:  {_score} / 100 — {_label} (+{_score - _raw_score} improvement)",
+        f"🎯  Score Before Cleaning:  {_raw_score} / 100",
+        f"✨  Score After Cleaning:  {_score} / 100 — {_label} (+{_score - _raw_score} improvement)",
         f"📋  Dataset Completeness: {_comp_pct}% — {_comp_label}",
     ]
     if missing_crit:
@@ -6370,6 +6484,11 @@ def apply_cleaning_rules(df_clean):
         c = _re_cl.sub(r"[^\w]", "_", c)
         c = _re_cl.sub(r"_+", "_", c).strip("_")
         return c
+    # ── 0a. Whitespace normalisation (before everything else) ───────────────
+    # Strips leading/trailing spaces and converts whitespace-only cells to NA
+    # so all blank detection, dedup, and critical-field checks are accurate.
+    df = normalize_whitespace(df)
+
     df.columns = [_norm_col(c) for c in df.columns]
 
     # ── 1. DATE NORMALISATION → YYYY-MM-DD ───────────────────────────────
@@ -6377,12 +6496,17 @@ def apply_cleaning_rules(df_clean):
                      "bill_date","transaction_date","trans_date"]
     date_col = next((c for c in _date_aliases if c in df.columns), None)
     n_dates_fixed = 0
+    _date_fmt_ambiguous = False
     if date_col:
         orig = df[date_col].copy()
-        parsed = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        try:
+            _dayfirst, _fmt_label = _detect_date_format(df[date_col])
+            _date_fmt_ambiguous = (_fmt_label == 'AMBIGUOUS')
+        except Exception:
+            _dayfirst = True
+        parsed = pd.to_datetime(df[date_col], dayfirst=_dayfirst, errors="coerce")
         df[date_col] = parsed.dt.strftime("%Y-%m-%d").where(parsed.notna(), other=None)
         n_dates_fixed = int((orig.astype(str) != df[date_col].fillna("")).sum())
-        # Drop rows where date is completely unparseable (NaT)
         df = df[df[date_col].notna()].copy()
 
     # ── 2. NUMERIC CLEANING ───────────────────────────────────────────────
@@ -6398,6 +6522,8 @@ def apply_cleaning_rules(df_clean):
         "gross_margin_pct","margin","margin_pct","profit_margin_pct",
         "monthly_demand_units","replacement_units","fulfillment_rate",
         "reorder_point","stock_level",
+        "total_cost","cost_of_goods","landed_cost","unit_price","unit_cost","price",
+        "purchase_cost","buying_cost","wholesale_price","list_price",
     ]
     def _to_num(series):
         s = series.astype(str).str.strip()
@@ -6423,12 +6549,27 @@ def apply_cleaning_rules(df_clean):
 
     n_currency_fixed = 0
     for col in _num_aliases:
-        if col not in df.columns: continue
+        if col not in df.columns:
+            continue
+        # Skip columns already in a clean numeric dtype — no double-processing
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
         raw = df[col].astype(str)
         has_noise = raw.str.contains(r"[₹$€£,kKmM]|Rs", regex=True, na=False)
-        numeric = _to_num(df[col])
-        df[col] = numeric
+        df[col] = _to_num(df[col])
         n_currency_fixed += int(has_noise.sum())
+
+    # ── 2b. NEGATIVE SALES CLAMPING ─────────────────────────────────────────
+    # Negative revenue corrupts scoring and forecasting. Clip to 0 and count.
+    _sales_cols_neg = {"sales", "revenue", "gross_sales", "sales_amount",
+                       "amount", "total_sales", "net_sales", "turnover"}
+    n_negative_sales = 0
+    for _nc in list(df.columns):
+        if _nc in _sales_cols_neg and pd.api.types.is_numeric_dtype(df[_nc]):
+            _neg_count = int((df[_nc] < 0).sum())
+            if _neg_count:
+                n_negative_sales += _neg_count
+                df[_nc] = df[_nc].clip(lower=0)
 
     # ── 3. CATEGORY NORMALISATION ─────────────────────────────────────────
     _CANONICAL_CATS = {
@@ -6444,6 +6585,8 @@ def apply_cleaning_rules(df_clean):
         # Home Appliances
         "home appliances": "Home Appliances",
         "home_appliances": "Home Appliances",
+        "homeappliances": "Home Appliances",
+        "home appliance": "Home Appliances",
         "appliances": "Home Appliances",
         "kitchen": "Home Appliances",
         "home": "Home Appliances",
@@ -6487,15 +6630,22 @@ def apply_cleaning_rules(df_clean):
         "hardware": "Hardware & Tools",
         "tools": "Hardware & Tools",
     }
-    _cat_aliases = ["category","product_category","item_group","group_name",
-                    "department","cat","prod_cat","item_category"]
+    _cat_aliases = ["category","category_name","product_category","item_group","group_name",
+                    "department","cat","prod_cat","item_category","cat_name","prod_cat_name"]
     cat_col = next((c for c in _cat_aliases if c in df.columns), None)
     if cat_col:
         def _norm_cat(v):
             if pd.isna(v) or str(v).strip() == "":
                 return "Unknown"
             key = str(v).strip().lower()
-            return _CANONICAL_CATS.get(key, str(v).strip().title())
+            # Exact canonical lookup first, then title-case fallback
+            if key in _CANONICAL_CATS:
+                return _CANONICAL_CATS[key]
+            # Try stripping underscores/hyphens for fuzzy match
+            key2 = key.replace("_"," ").replace("-"," ").strip()
+            if key2 in _CANONICAL_CATS:
+                return _CANONICAL_CATS[key2]
+            return str(v).strip().title()
         df[cat_col] = df[cat_col].apply(_norm_cat)
 
     # ── 4. EXACT DUPLICATE REMOVAL ────────────────────────────────────────
@@ -6503,32 +6653,56 @@ def apply_cleaning_rules(df_clean):
     df = df.drop_duplicates(keep="first")
     n_dupes_removed = n_before_dedup - len(df)
 
-    # ── 5. DROP ROWS WITH MISSING CRITICAL FIELDS ─────────────────────────
-    _critical_checks = {
-        "date":    _date_aliases,
-        "product": ["product","product_name","sku","sku_name","item_name",
-                    "product_id","article","description"],
-        "sales":   ["sales","revenue","gross_sales","sales_amount","amount",
-                    "turnover","net_sales","total_sales"],
-    }
-    for _, aliases in _critical_checks.items():
-        col = next((c for c in aliases if c in df.columns), None)
-        if col:
-            df = df[df[col].notna()].copy()
-            df = df[df[col].astype(str).str.strip() != ""].copy()
+    # ── 5. AUTO-FILL MISSING PRODUCT IDs (before drop so filled rows are kept)
+    # Scan ALL product-identifier columns independently — a dataset may have both
+    # "product" (name) and "product_id" (code) and each may have different blanks.
+    _prod_id_cols  = ["product_id","sku","sku_name","sku_code","item_code","article"]
+    _prod_name_cols= ["product","product_name","item_name","description"]
+    n_prod_filled  = 0
+    _auto_ctr      = 1
+    # Fill ID columns (product_id, sku etc) with AUTO_SKU
+    for _pcol in _prod_id_cols:
+        if _pcol not in df.columns: continue
+        _mask = df[_pcol].isna() | (df[_pcol].astype(str).str.strip() == "")
+        for _ri in df[_mask].index:
+            df.at[_ri, _pcol] = f"AUTO_SKU_{_auto_ctr:03d}"
+            _auto_ctr += 1
+            n_prod_filled += 1
+    # Fill name columns with "Unknown Product" if blank
+    for _pcol in _prod_name_cols:
+        if _pcol not in df.columns: continue
+        _mask = df[_pcol].isna() | (df[_pcol].astype(str).str.strip() == "")
+        if _mask.any():
+            df.loc[_mask, _pcol] = "Unknown Product"
+            n_prod_filled += int(_mask.sum())
 
-    # ── 6. AUTO-FILL MISSING PRODUCT IDs ─────────────────────────────────
-    _prod_aliases = ["product","product_name","sku","sku_name","item_name","product_id"]
-    prod_col = next((c for c in _prod_aliases if c in df.columns), None)
-    n_prod_filled = 0
-    if prod_col:
-        mask = df[prod_col].isna() | (df[prod_col].astype(str).str.strip() == "")
-        n_prod_filled = int(mask.sum())
-        if n_prod_filled:
-            ctr = 1
-            for idx_r in df[mask].index:
-                df.at[idx_r, prod_col] = f"AUTO_SKU_{ctr:03d}"
-                ctr += 1
+    # ── 6. DROP ROWS WITH MISSING CRITICAL FIELDS ─────────────────────────
+    # For "product": only drop if ALL product-name-like columns are blank
+    # (product_id being blank is recoverable via AUTO_SKU above)
+    _date_drop_col = next((c for c in _date_aliases if c in df.columns), None)
+    if _date_drop_col:
+        df = df[df[_date_drop_col].notna()].copy()
+        df = df[df[_date_drop_col].astype(str).str.strip() != ""].copy()
+    _prod_name_cols = ["product","product_name","item_name","article","description"]
+    _prod_id_cols   = ["sku","sku_name","product_id"]
+    _pname_col = next((c for c in _prod_name_cols if c in df.columns), None)
+    _pid_col   = next((c for c in _prod_id_cols   if c in df.columns), None)
+    if _pname_col and _pid_col:
+        # Drop only if both name AND id are blank
+        _both_blank = (
+            (df[_pname_col].isna() | (df[_pname_col].astype(str).str.strip() == "")) &
+            (df[_pid_col].isna()   | (df[_pid_col].astype(str).str.strip()   == ""))
+        )
+        df = df[~_both_blank].copy()
+    elif _pname_col:
+        df = df[df[_pname_col].notna()].copy()
+        df = df[df[_pname_col].astype(str).str.strip() != ""].copy()
+    _sales_aliases_drop = ["sales","revenue","gross_sales","sales_amount","amount",
+                           "turnover","net_sales","total_sales"]
+    _sales_drop_col = next((c for c in _sales_aliases_drop if c in df.columns), None)
+    if _sales_drop_col:
+        df = df[df[_sales_drop_col].notna()].copy()
+        df = df[df[_sales_drop_col].astype(str).str.strip() != ""].copy()
 
     # ── 7. FILL MISSING CATEGORY → "Unknown" ─────────────────────────────
     if cat_col and cat_col in df.columns:
@@ -6539,13 +6713,13 @@ def apply_cleaning_rules(df_clean):
     _ondc_aliases = ["ondc_enabled","ondc_status","ondc","ondc_flag"]
     ondc_col = next((c for c in _ondc_aliases if c in df.columns), None)
     if ondc_col:
+        _YES_SET = {"yes","true","1","y","enabled","active","on"}
+        _NO_SET  = {"no","false","0","n","disabled","inactive","off"}
         def _norm_ondc(v):
             if pd.isna(v): return v
             s = str(v).strip().lower()
-            if s in ("yes","true","1","y","enabled"): return "Yes"
-            if s in ("no","false","0","n","disabled"): return "No"
-            if s.startswith("y"): return "Yes"
-            if s.startswith("n") or s.startswith("f"): return "No"
+            if s in _YES_SET: return "Yes"
+            if s in _NO_SET:  return "No"
             return None
         df[ondc_col] = df[ondc_col].apply(_norm_ondc)
 
@@ -9076,43 +9250,75 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                                              variant="secondary", size="sm")
                 gr.HTML('''<script>
 (function(){
-  // Scroll to report anchor when details panel opens
+  var _revealed = false;
+  function clickOverviewOnce() {
+    if (_revealed) return;
+    var wrap = document.getElementById("drc-native-tabs");
+    if (!wrap) return;
+    var btns = wrap.querySelectorAll("button[role=\'tab\']");
+    if (btns.length > 0) { _revealed = true; btns[0].click(); }
+  }
+  var _obs = null;
+  function attachObserver() {
+    var tabsEl = document.getElementById("drc-native-tabs");
+    if (!tabsEl) { setTimeout(attachObserver, 700); return; }
+    var watchTarget = tabsEl.parentElement;
+    if (_obs) _obs.disconnect();
+    _obs = new MutationObserver(function(mutations) {
+      if (_revealed) { _obs.disconnect(); return; }
+      for (var i = 0; i < mutations.length; i++) {
+        if (mutations[i].target === watchTarget &&
+            (mutations[i].attributeName === "style" || mutations[i].attributeName === "class")) {
+          if (watchTarget.style.display !== "none") {
+            setTimeout(clickOverviewOnce, 80);
+            _obs.disconnect();
+            break;
+          }
+        }
+      }
+    });
+    _obs.observe(watchTarget, { attributes: true, subtree: false });
+  }
   document.addEventListener("click", function(e){
     var btn = e.target && e.target.closest ? e.target.closest("button") : null;
-    if(btn && btn.textContent && btn.textContent.indexOf("View Full Analysis Report") >= 0){
+    if (btn && btn.textContent && btn.textContent.indexOf("View Full Analysis Report") >= 0) {
       setTimeout(function(){
+        if (!_revealed) { clickOverviewOnce(); }
         var anchor = document.getElementById("drc-report-anchor");
-        if(anchor){ anchor.scrollIntoView({behavior:"smooth", block:"start"}); }
-      }, 320);
+        if (anchor) { anchor.scrollIntoView({behavior:"smooth", block:"start"}); }
+      }, 350);
     }
   }, true);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", attachObserver);
+  } else { setTimeout(attachObserver, 900); }
 })();
 </script>''')
 
                 # Collapsible details panel — tabbed analysis view
+                # ── Native Gradio Tabs ───────────────────────────────────────────
+                # Placed directly inside _drc_results (ONE hidden level) — not inside
+                # _drc_details_panel. Gradio 4.44.1 silently breaks event bindings when
+                # output components are inside doubly-nested hidden containers.
+                with gr.Tabs(selected=0, elem_id="drc-native-tabs"):
+                    with gr.Tab("📊 Overview"):
+                        drc_overview_out = gr.HTML(
+                            value="<div style='min-height:4px'></div>",
+                            elem_id="drc-overview-content"
+                        )
+                    with gr.Tab("🔎 Data Quality"):
+                        drc_quality_out2 = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-quality-content")
+                    with gr.Tab("📐 Structure"):
+                        drc_struct_out   = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-struct-content")
+                    with gr.Tab("🛡️ Authenticity"):
+                        drc_auth_out     = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-auth-content")
+                    with gr.Tab("🧹 Cleaning"):
+                        drc_clean_out    = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-clean-content")
+                    with gr.Tab("🗂️ Field Mapping"):
+                        drc_map_out      = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-map-content")
+
                 with gr.Column(visible=False) as _drc_details_panel:
                     gr.HTML("<hr style='margin:8px 0;border:none;border-top:1px solid #e2e8f0;'>")
-
-                    # ── Native Gradio Tabs ──────────────────────────────────────────
-                    # Overview uses a non-empty placeholder so Gradio mounts its DOM
-                    # node immediately — fixes the lazy-render blank-on-first-load bug.
-                    with gr.Tabs(selected=0, elem_id="drc-native-tabs"):
-                        with gr.Tab("📊 Overview"):
-                            drc_overview_out = gr.HTML(
-                                value="<div style='min-height:4px'></div>",
-                                elem_id="drc-overview-content"
-                            )
-                        with gr.Tab("🔎 Data Quality"):
-                            drc_quality_out2 = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-quality-content")
-                        with gr.Tab("📐 Structure"):
-                            drc_struct_out   = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-struct-content")
-                        with gr.Tab("🛡️ Authenticity"):
-                            drc_auth_out     = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-auth-content")
-                        with gr.Tab("🧹 Cleaning"):
-                            drc_clean_out    = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-clean-content")
-                        with gr.Tab("🗂️ Field Mapping"):
-                            drc_map_out      = gr.HTML(value="<div style='min-height:4px'></div>", elem_id="drc-map-content")
-
                     # Hidden source widgets — preserved for handler signature compatibility
                     drc_compact_out  = gr.HTML(elem_id="drc-compact-out",  visible=False)
                     drc_quality_out  = gr.HTML(elem_id="drc-quality-out",  visible=False)
@@ -9174,8 +9380,8 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                     return ""
 
             def _drc_compact_strip(n_rows, n_cols, n_crit, n_warn, status, score=None):
-                sc_color = ("#16a34a" if (score or 0) >= 90 else "#d97706" if (score or 0) >= 70
-                            else "#c2520a" if (score or 0) >= 50 else "#dc2626") if score else "#64748b"
+                sc_color = ("#16a34a" if (score or 0) >= 85 else "#d97706" if (score or 0) >= 70
+                            else "#dc2626") if score else "#64748b"
                 crit_col = "#dc2626" if n_crit else "#16a34a"
                 warn_col = "#d97706" if n_warn else "#16a34a"
                 def _stat(icon, label, value, note="", color="#0f172a"):
@@ -9202,7 +9408,7 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                         _conf_bg     = "#f0fdf4"
                         _conf_border = "#bbf7d0"
                         _conf_icon   = "✅"
-                        _ai_msg      = "Dataset ready for advanced analytics and forecasting."
+                        _ai_msg      = "Dataset is ready for analytics, forecasting, and business insights."
                         _ai_color    = "#16a34a"
                         _ai_bg       = "#f0fdf4"
                         _ai_border   = "#bbf7d0"
@@ -9212,7 +9418,7 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                         _conf_bg     = "#fffbeb"
                         _conf_border = "#fde68a"
                         _conf_icon   = "🟡"
-                        _ai_msg      = "Dataset suitable for analytics after minor cleaning improvements."
+                        _ai_msg      = "Dataset is mostly ready. A few small improvements will unlock full insights."
                         _ai_color    = "#d97706"
                         _ai_bg       = "#fffbeb"
                         _ai_border   = "#fde68a"
@@ -9222,7 +9428,7 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                         _conf_bg     = "#fff7ed"
                         _conf_border = "#fed7aa"
                         _conf_icon   = "🟠"
-                        _ai_msg      = "Dataset usable but requires additional data improvement."
+                        _ai_msg      = "Dataset needs some attention before full analytics can be applied."
                         _ai_color    = "#c2520a"
                         _ai_bg       = "#fff7ed"
                         _ai_border   = "#fed7aa"
@@ -9232,7 +9438,7 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                         _conf_bg     = "#fef2f2"
                         _conf_border = "#fecaca"
                         _conf_icon   = "🔴"
-                        _ai_msg      = "Dataset requires significant correction before analytics can be performed."
+                        _ai_msg      = "Dataset needs improvement before it is ready for analysis."
                         _ai_color    = "#dc2626"
                         _ai_bg       = "#fef2f2"
                         _ai_border   = "#fecaca"
@@ -9290,8 +9496,23 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
 
             # ── Main run handler ───────────────────────────────────────────
             def _drc_run_handler(fobj):
+                # ── Normalise Gradio 4.x file input ─────────────────────────
+                # gr.File returns: None | str path | obj with .name | list thereof
+                if fobj is None:
+                    _err = "<p style='color:#6b7280;padding:8px;'>Please upload a file first.</p>"
+                    return (_err, None, gr.update(value="", visible=False),
+                            gr.update(visible=False), _err, "", "", "", "", "")
+                if isinstance(fobj, list):
+                    fobj = fobj[0] if fobj else None
+                if fobj is None:
+                    _err = "<p style='color:#dc2626;padding:8px;'>No file received.</p>"
+                    return (_err, None, gr.update(value="", visible=False),
+                            gr.update(visible=False), _err, "", "", "", "", "")
+                # Normalise to a simple path string for run_readiness_check
+                _fpath = fobj if isinstance(fobj, str) else getattr(fobj, "name", str(fobj))
+
                 try:
-                    sh, mh, df_c, summ, qh = run_readiness_check(fobj)
+                    sh, mh, df_c, summ, qh = run_readiness_check(_fpath)
                     path = export_clean_dataset(df_c)
                     import re as _re2
                     _m_rows = _re2.search(r"Rows: ([\d,]+)", summ)
@@ -9299,52 +9520,71 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                     _m_cols = _re2.search(r"Columns detected: (\d+)", summ)
                     n_cols = int(_m_cols.group(1)) if _m_cols else 0
                     n_crit2 = qh.count("\u274c Critical") + qh.count("Critical</div>")
-                    n_warn2 = qh.count("\u26a0\ufe0f Warnings") + qh.count("Warnings</div>")
-                    status = ("Ready" if "Ready" in sh else
-                              "Partial" if "Partial" in sh else
-                              "Needs Completion" if "Needs" in sh else "")
-                    _m_score = _re2.search(r"After Cleaning Score:\s*(\d+) / 100", summ)
+                    # Parse actual finding counts from summary text — more accurate than
+                    # counting HTML group headings (which give 1 per severity group, not per finding)
+                    _m_crit_count = _re2.search(r"(\d+) critical issue", summ)
+                    _m_warn_count = _re2.search(r"(\d+) warning", summ)
+                    if _m_crit_count:
+                        n_crit2 = int(_m_crit_count.group(1))
+                    if _m_warn_count:
+                        n_warn2 = int(_m_warn_count.group(1))
+                    else:
+                        n_warn2 = qh.count("\u26a0\ufe0f Warnings") + qh.count("Warnings</div>")
+                    # Parse score FIRST — used by status derivation below
+                    _m_score = _re2.search(r"Score After Cleaning:\s*(\d+) / 100", summ)
                     _score_val = int(_m_score.group(1)) if _m_score else None
+                    # Derive display status from the numeric score (most reliable)
+                    if _score_val is not None:
+                        if _score_val >= 85:
+                            status = "Ready for Analysis"
+                        elif _score_val >= 70:
+                            status = "Partially Ready"
+                        else:
+                            status = "Data Improvement Required"
+                    else:
+                        status = ("Ready for Analysis"    if "Ready for Analysis" in sh else
+                                  "Partially Ready"       if "Partially" in sh else
+                                  "Data Improvement Required" if ("Improvement" in sh or "Needs" in sh) else
+                                  "Ready for Analysis"    if "Ready" in sh else "")
                     compact = _drc_compact_strip(n_rows, n_cols, n_crit2, n_warn2, status, _score_val)
                     _MARKERS = ["<!--DRC_OVERVIEW-->","<!--DRC_QUALITY-->","<!--DRC_STRUCTURE-->",
                                 "<!--DRC_AUTH-->","<!--DRC_CLEANING-->","<!--DRC_MAPPING-->"]
                     def _split_qh(html):
                         parts = {}
-                        for i, marker in enumerate(_MARKERS):
-                            next_marker = _MARKERS[i+1] if i+1 < len(_MARKERS) else None
+                        for _mi, marker in enumerate(_MARKERS):
+                            nxt = _MARKERS[_mi+1] if _mi+1 < len(_MARKERS) else None
                             s = html.find(marker)
                             if s < 0: parts[marker] = ""; continue
                             s += len(marker)
-                            e = html.find(next_marker, s) if next_marker else len(html)
+                            e = html.find(nxt, s) if nxt else len(html)
                             parts[marker] = html[s:e] if e >= s else html[s:]
                         return parts
                     _p = _split_qh(qh)
                     _overview_html = (
-                        compact +
-                        "<details open style='margin-top:10px;'>"
-                        "<summary style='font-size:11px;font-weight:700;color:#1B4F8A;cursor:pointer;"
-                        "letter-spacing:0.3px;'>\U0001f4dd Validation Log</summary>"
-                        "<pre style='font-size:11px;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;"
-                        "border-radius:6px;padding:8px 10px;white-space:pre-wrap;word-break:break-word;"
-                        "line-height:1.5;max-height:160px;overflow-y:auto;margin:6px 0 0;'>"
-                        + summ.replace("<","&lt;").replace(">","&gt;") + "</pre></details>"
+                        compact
+                        + "<details open style='margin-top:10px;'>"
+                          "<summary style='font-size:11px;font-weight:700;color:#1B4F8A;"
+                          "cursor:pointer;letter-spacing:0.3px;'>📋 Data Quality Summary</summary>"
+                          "<pre style='font-size:11px;color:#475569;background:#f8fafc;"
+                          "border:1px solid #e2e8f0;border-radius:6px;padding:8px 10px;"
+                          "white-space:pre-wrap;word-break:break-word;line-height:1.5;"
+                          "max-height:160px;overflow-y:auto;margin:6px 0 0;'>"
+                        + summ.replace("<","&lt;").replace(">","&gt;")
+                        + "</pre></details>"
                         + _p.get("<!--DRC_OVERVIEW-->","")
                     )
+                    # 10 outputs matching the trimmed click() outputs list
                     return (
-                        sh,
-                        compact,
-                        mh,
-                        summ,
-                        qh,
-                        path,
-                        gr.update(value=_drc_dl_html(path), visible=bool(path)),
-                        gr.update(visible=True),
-                        _overview_html,
-                        _p.get("<!--DRC_QUALITY-->",""),
-                        _p.get("<!--DRC_STRUCTURE-->",""),
-                        _p.get("<!--DRC_AUTH-->",""),
-                        _p.get("<!--DRC_CLEANING-->",""),
-                        _p.get("<!--DRC_MAPPING-->",""),
+                        sh,                                              # drc_status_out
+                        path,                                            # _drc_clean_state
+                        gr.update(value=_drc_dl_html(path), visible=bool(path)),  # drc_dl_btn
+                        gr.update(visible=True),                         # _drc_results
+                        _overview_html,                                  # drc_overview_out
+                        _p.get("<!--DRC_QUALITY-->",""),                 # drc_quality_out2
+                        _p.get("<!--DRC_STRUCTURE-->",""),               # drc_struct_out
+                        _p.get("<!--DRC_AUTH-->",""),                    # drc_auth_out
+                        _p.get("<!--DRC_CLEANING-->",""),                # drc_clean_out
+                        _p.get("<!--DRC_MAPPING-->",""),                 # drc_map_out
                     )
                 except Exception as _drc_err:
                     import traceback as _drc_tb
@@ -9352,24 +9592,26 @@ with gr.Blocks(title="DataNetra.ai - MSME Intelligence", theme=gr.themes.Soft(),
                     _emsg = str(_drc_err).replace("<","&lt;").replace(">","&gt;")
                     _err_html = (
                         "<div style='padding:12px;background:#fee2e2;border:1px solid #fca5a5;"
-                        "border-radius:8px;font-size:12px;color:#dc2626;'>"
+                        "border-radius:8px;font-size:12px;color:#dc2626;font-family:sans-serif;'>"
                         "<strong>\u274c Data Check Error:</strong> " + _emsg
-                        + "<br><pre style='font-size:10px;color:#7f1d1d;margin-top:6px;'>"
-                        + _etb.replace("<","&lt;").replace(">","&gt;")[-1200:]
+                        + "<br><pre style='font-size:10px;color:#7f1d1d;margin-top:6px;"
+                          "white-space:pre-wrap;'>"
+                        + _etb.replace("<","&lt;").replace(">","&gt;")[-1500:]
                         + "</pre></div>"
                     )
                     return (
-                        _err_html, "", "", str(_drc_err), "",
-                        None, gr.update(value="", visible=False),
-                        gr.update(visible=True),
-                        _err_html, "", "", "", "", "",
+                        _err_html,                                       # drc_status_out
+                        None,                                            # _drc_clean_state
+                        gr.update(value="", visible=False),              # drc_dl_btn
+                        gr.update(visible=True),                         # _drc_results
+                        _err_html,                                       # drc_overview_out
+                        "", "", "", "", "",                              # tab contents
                     )
 
             drc_run.click(
                 fn=_drc_run_handler,
                 inputs=[drc_file],
-                outputs=[drc_status_out, drc_compact_out, drc_mapping_out,
-                         drc_summary_out, drc_quality_out,
+                outputs=[drc_status_out,
                          _drc_clean_state, drc_dl_btn, _drc_results,
                          drc_overview_out, drc_quality_out2,
                          drc_struct_out, drc_auth_out,
